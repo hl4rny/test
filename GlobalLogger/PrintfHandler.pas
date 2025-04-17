@@ -914,7 +914,7 @@ end;
 
 procedure TPrintfLogForm.FormClose(Sender: TObject; var CloseAction: TCloseAction);
 begin
-  // 폼이 닫힐 때 처리
+  // 폼이 닫힐 때 처리 - 항상 트레이로 숨기기
   CloseAction := caNone; // 폼이 실제로 닫히지 않도록 함
   Hide; // 대신 폼을 숨김
 
@@ -3454,15 +3454,51 @@ var
   LogItem: PPrintfLogQueueItem;
   List: TList;
   SourceStr: string;
+  CleanMsg: string;
+  TimeStart, TimeEnd, LevelStart, LevelEnd, SourceStart, SourceEnd: Integer;
 begin
   // 소스 식별자 가져오기
   SourceStr := SourceIdentifier;
+
+  // 메시지 정제 - 이미 [시간] [레벨] [소스] 형식으로 되어 있는지 확인
+  CleanMsg := Msg;
+
+  // 메시지에서 이미 [시간] [레벨] [소스] 형식이 있는지 확인하고 제거
+  if (Length(Msg) > 2) and (Msg[1] = '[') then
+  begin
+    TimeStart := 1;
+    TimeEnd := Pos(']', Msg, TimeStart);
+
+    if TimeEnd > TimeStart then
+    begin
+      LevelStart := Pos('[', Msg, TimeEnd);
+      if LevelStart > 0 then
+      begin
+        LevelEnd := Pos(']', Msg, LevelStart);
+
+        if LevelEnd > LevelStart then
+        begin
+          SourceStart := Pos('[', Msg, LevelEnd);
+          if SourceStart > 0 then
+          begin
+            SourceEnd := Pos(']', Msg, SourceStart);
+
+            if (SourceEnd > SourceStart) and (SourceEnd < Length(Msg)) then
+            begin
+              // [시간] [레벨] [소스] 형식의 접두어가 있음 - 실제 메시지만 추출
+              CleanMsg := Trim(Copy(Msg, SourceEnd + 1, Length(Msg)));
+            end;
+          end;
+        end;
+      end;
+    end;
+  end;
 
   if AsyncMode = amThread then
   begin
     // 비동기 모드: 큐에 메시지 추가
     New(LogItem);
-    LogItem^.Message := Msg;
+    LogItem^.Message := CleanMsg; // 정제된 메시지 사용
     LogItem^.Level := Level;
     LogItem^.Source := SourceStr; // 소스 정보
 
@@ -3483,7 +3519,7 @@ begin
     if Assigned(FLogForm) then
     begin
       try
-        FLogForm.AddLog(Msg, Level, SourceStr); // 소스 정보 전달
+        FLogForm.AddLog(CleanMsg, Level, SourceStr); // 정제된 메시지 및 소스 정보 전달
       except
         // 추가 실패 무시
       end;
