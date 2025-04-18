@@ -430,6 +430,24 @@ implementation
 uses Windows;
 {$ENDIF}
 
+
+procedure DebugToFile(const Msg: string);
+var
+  F: TextFile;
+begin
+  AssignFile(F, 'debug.log');
+  try
+    if FileExists('debug.log') then
+      Append(F)
+    else
+      Rewrite(F);
+    WriteLn(F, FormatDateTime('yyyy-mm-dd hh:nn:ss.zzz', Now) + ': ' + Msg);
+  finally
+    CloseFile(F);
+  end;
+end;
+
+
 { TSourceStatForm }
 
 constructor TSourceStatForm.Create(AOwner: TComponent);
