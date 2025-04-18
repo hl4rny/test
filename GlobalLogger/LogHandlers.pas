@@ -160,6 +160,9 @@ begin
 end;
 
 procedure TLogHandler.Deliver(const Msg: string; Level: TLogLevel; const Tag: string);
+var
+  OriginalSourceId: string;
+  CombinedSourceId: string;
 begin
   // 로그 레벨과 태그 기준으로 로깅 여부 결정
   if not ShouldLog(Level, Tag) then
@@ -172,8 +175,25 @@ begin
   // 스레드 안전성 확보
   FLock.Enter;
   try
-    // 실제 로깅 작업은 자식 클래스의 WriteLog에서 처리
-    WriteLog(Msg, Level);
+    // 태그 정보가 있는 경우, 소스 식별자와 결합
+    OriginalSourceId := FSourceIdentifier;
+    try
+      if (Tag <> '') then
+      begin
+        if (FSourceIdentifier <> '') then
+          CombinedSourceId := Format('%s:%s', [FSourceIdentifier, Tag])
+        else
+          CombinedSourceId := Tag;
+
+        FSourceIdentifier := CombinedSourceId;
+      end;
+
+      // 실제 로깅 작업은 자식 클래스의 WriteLog에서 처리
+      WriteLog(Msg, Level);
+    finally
+      // 원래 소스 식별자 복원
+      FSourceIdentifier := OriginalSourceId;
+    end;
   finally
     FLock.Leave;
   end;
