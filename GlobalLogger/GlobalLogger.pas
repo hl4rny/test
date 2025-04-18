@@ -258,6 +258,7 @@ type
 
 // 간편한 전역 액세스 함수
 function Logger: TGlobalLogger;
+function GetPrintfHandler: TPrintfHandler;
 
 implementation
 
@@ -285,6 +286,31 @@ var
 function Logger: TGlobalLogger;
 begin
   Result := TGlobalLogger.GetInstance;
+end;
+
+function GetPrintfHandler: TPrintfHandler;
+var
+  i: Integer;
+  Handler: TLogHandler;
+  HandlerList: TList;
+begin
+  Result := nil;
+
+  // Logger의 내부 핸들러 리스트에 접근
+  HandlerList := Logger.FHandlers; // 또는 Logger.GetHandlers 등 적절한 메서드 사용
+
+  if Assigned(HandlerList) then
+  begin
+    for i := 0 to HandlerList.Count - 1 do
+    begin
+      Handler := TLogHandler(HandlerList[i]);
+      if Handler is TPrintfHandler then
+      begin
+        Result := TPrintfHandler(Handler);
+        Break;
+      end;
+    end;
+  end;
 end;
 
 { TGlobalLogger }
