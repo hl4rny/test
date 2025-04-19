@@ -721,3 +721,105 @@ begin
 end;
 
 end.
+{
+이 코드는 월별 로그 테이블을 자동으로 관리하는 시스템을 구현합니다. 다음과 같은 주요 기능을 포함하고 있습니다:
+주요 기능
+
+자동 테이블 생성
+
+월별로 새로운 로그 테이블을 자동 생성합니다 (예: LOG_202504)
+각 테이블에 필요한 인덱스를 함께 생성합니다
+
+
+메타데이터 관리
+
+LOG_META 테이블에서 모든 로그 테이블의 정보를 관리합니다
+테이블별 생성 날짜, 마지막 업데이트, 행 수 등을 기록합니다
+
+
+자동 유지보수
+
+설정된 보관 기간(기본 12개월)이 지난 로그 테이블을 자동 삭제합니다
+주기적으로 테이블 메트릭을 업데이트합니다
+
+
+효율적인 조회
+
+여러 테이블에 걸친 조회를 자동으로 처리합니다
+날짜, 로그 레벨, 소스 등으로 필터링할 수 있습니다
+
+다음 설정을 적용했습니다:
+
+데이터베이스 파일: App\log\Log.fdb
+Firebird 클라이언트: App\fbclient.dll
+자동 경로 생성 및 DB 초기화 포함
+
+이 구현은 로그 데이터가 시간이 지남에 따라 늘어나도 성능이 유지되도록 설계되었습니다.
+필요에 따라 RetentionMonths 속성을 조정하여 로그 보관 기간을 변경할 수 있습니다.
+
+이 소스 코드는 다음 요소들을 모두 포함하고 있습니다:
+
+유닛 선언 및 인터페이스 섹션
+TDatabaseLogHandler 클래스 정의 및 모든 메서드
+구현 섹션의 모든 메서드 구현
+DB 생성, 연결, 테이블 관리 등 모든 기능
+
+요청하신 사항(App\log\Log.fdb 경로와 App\fbclient.dll 라이브러리 위치 등)을 모두 반영했습니다.
+이 코드를 그대로 GlobalLogger 프로젝트에 포함시켜 사용하실 수 있습니다.
+
+// 데이터베이스 로그 핸들러 등록
+var
+  DBHandler: TDatabaseLogHandler;
+begin
+  DBHandler := TDatabaseLogHandler.Create;
+  DBHandler.RetentionMonths := 6; // 선택적: 기본값은 12개월
+  GlobalLogger.RegisterLogHandler(DBHandler);
+
+  // 이제 로그를 기록하면 자동으로 DB에 저장됩니다
+  GlobalLogger.LogInfo('애플리케이션 시작됨');
+end;
+
+
+
+GlobalLogger와 통합
+
+TLogHandler 클래스를 상속하여 GlobalLogger 시스템과 완벽하게 통합됩니다
+DoWriteLog 메서드를 오버라이드하여
+GlobalLogger에서 로그 메시지를 받아 데이터베이스에 저장합니다
+SourceIdentifier 시스템을 활용하여 로그 소스 정보를 저장합니다
+
+
+월별 로그 테이블 자동 관리
+
+매월 새로운 테이블을 자동으로 생성합니다 (예: LOG_202504)
+LOG_META 테이블에서 모든 로그 테이블의 정보를 관리합니다
+지정된 기간(기본 12개월)이 지난 오래된 테이블을 자동으로 삭제합니다
+
+
+효율적인 다중 테이블 조회
+
+GetLogs 메서드를 통해 여러 테이블에 걸친 로그를 쉽게 조회할 수 있습니다
+날짜, 로그 레벨, 태그로 필터링이 가능합니다
+
+
+Firebird DB 설정
+
+App\log\Log.fdb 경로에 데이터베이스 파일을 생성합니다
+App\fbclient.dll 경로의 클라이언트 라이브러리를 사용합니다
+
+
+
+이 코드는 다음과 같이 GlobalLogger 시스템에서 사용할 수 있습니다:
+// 초기화 예시
+var
+  DBHandler: TDatabaseLogHandler;
+begin
+  // 데이터베이스 로그 핸들러 생성 및 등록
+  DBHandler := TDatabaseLogHandler.Create;
+  DBHandler.RetentionMonths := 6; // 6개월 보관으로 설정
+  GlobalLogger.RegisterLogHandler(DBHandler);
+
+  // 이제 GlobalLogger를 통해 기록되는 모든 로그가 DB에도 저장됩니다
+  Logger.LogInfo('애플리케이션 시작');
+end;
+}
