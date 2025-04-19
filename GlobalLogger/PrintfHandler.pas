@@ -95,6 +95,8 @@ type
   private
     FListView: TListView;
     FCloseButton: TButton;
+    FButtonPanel: TPanel;
+
     procedure CloseButtonClick(Sender: TObject);
   public
     constructor Create(AOwner: TComponent); reintroduce;
@@ -175,6 +177,19 @@ type
     FCurrentSearchNode: PVirtualNode; // 현재 검색 노드
     FUniqueSourceList: TStringList; // 고유 소스 목록 저장 (통계 및 자동완성용)
 
+    // 자동 새로고침 관련 필드
+    FAutoRefreshTimer: TTimer;
+    FAutoRefreshEnabled: Boolean;
+    FAutoRefreshInterval: Integer; // 밀리초 단위
+    FLastLoadedFileName: string;
+    FPreserveScrollPos: Boolean;
+    FLastVisibleNode: PVirtualNode;
+    FLastFileSize: Int64;              // 마지막으로 로드한 파일 크기
+    FLastFileModified: TDateTime;      // 마지막 파일 수정 시간
+    FLastLineBuffer: array of string;  // 마지막으로 읽은 파일의 마지막 몇 줄
+    FFirstRefreshDone: Boolean;        // 첫 새로고침 완료 여부
+    FSkipNextRefresh: Boolean;         // 다음 새로고침 건너뛰기 플래그
+
     procedure StatusBarDblClick(Sender: TObject);
     procedure CreatePopupMenu;
     procedure PopupMenuClick(Sender: TObject);
@@ -240,6 +255,30 @@ type
 
     // 로그 파일 로드 메서드
     procedure LoadLogsFromFile(const FileName: string);
+    // 자동 새로고침 메뉴 추가
+    procedure AddAutoRefreshMenuItem;
+    // 스크롤 위치 유지 옵션 클릭 이벤트
+    procedure OnPreserveScrollPosClick(Sender: TObject);
+    // 자동 새로고침 메뉴 클릭 이벤트
+    procedure OnAutoRefreshMenuClick(Sender: TObject);
+    // 메뉴 항목 체크 상태 업데이트
+    procedure UpdateAutoRefreshMenuChecks(SelectedInterval: Integer);
+    // 타이머 이벤트 핸들러
+    procedure OnAutoRefreshTimer(Sender: TObject);
+    // 파일 정보 갱신 메서드
+    procedure UpdateFileInfo(const FileName: string);
+    // 파일 속성 변경 확인 메서드
+    function HasFileAttributesChanged(const FileName: string): Boolean;
+    // 수동 새로고침 메뉴 클릭 이벤트
+    procedure OnManualRefreshClick(Sender: TObject);
+    // 파일 변경 감지 함수 - 파일 끝 부분만 읽어서 비교
+    function HasFileContentChanged(const FileName: string): Boolean;
+    // 로그 파일 다시 로드 메서드
+    procedure ReloadLogFile;
+    // 파일 크기 가져오기 함수
+    function GetFileSize(const FileName: string): Int64;
+
+
     // 날짜/시간 형식 검증 함수
     function IsValidDateTimeFormat(const DateTimeStr: string): Boolean;
     // 로그 레벨 검증 함수
@@ -351,6 +390,15 @@ type
     // 컬럼 가시성 설정
     procedure SetColumnVisibility(const Value: TColumnVisibility);
 
+    // 현재 로깅 중인 파일 열기 기능
+    procedure ViewCurrentLogFile;
+    // 가장 최근의 로그 파일 찾기
+    function FindMostRecentLogFile(const LogFolder: string): string;
+    // TPrintfHandler 클래스 내 메인 메뉴에 항목 추가
+    procedure AddViewCurrentLogMenuItem;
+    // 메뉴 클릭 이벤트 핸들러
+    procedure ViewCurrentLogMenuClick(Sender: TObject);
+
   protected
     procedure WriteLog(const Msg: string; Level: TLogLevel); override;
 
@@ -455,8 +503,8 @@ begin
   inherited CreateNew(AOwner);
 
   Caption := '소스별 로그 통계';
-  Width := 500;
-  Height := 400;
+  Width := 450;         // 폼 너비 줄임 (500 -> 450)
+  Height := 300;        // 폼 높이 줄임 (400 -> 300)
   Position := poScreenCenter;
   BorderStyle := bsSizeable;
 
@@ -471,11 +519,11 @@ begin
     RowSelect := True;
     ReadOnly := True;
 
-    // 컬럼 설정
+    // 컬럼 설정 수정
     with Columns.Add do
     begin
       Caption := '소스';
-      Width := 200;
+      Width := 150;     // 소스 컬럼 너비 줄임 (200 -> 150)
     end;
     with Columns.Add do
     begin
@@ -497,7 +545,7 @@ begin
     end;
   end;
 
-  // 닫기 버튼
+  // 닫기 버튼 위치 수정
   FCloseButton := TButton.Create(Self);
   with FCloseButton do
   begin
@@ -506,9 +554,31 @@ begin
     ModalResult := mrOk;
     Default := True;
     Cancel := True;
-    SetBounds(Width - 100, Height - 40, 80, 30);
-    Anchors := [akRight, akBottom];
+    Width := 80;
+    Height := 30;
+
+    // 버튼 위치를 폼 하단 중앙으로 수정
+    Left := (Width - 80) div 2;        // 폼 중앙에 배치
+    Top := Height - 40;                // 하단에서 40픽셀 위
+    Anchors := [akBottom];             // 하단에 고정
+
     OnClick := @CloseButtonClick;
+  end;
+
+  // 버튼 패널 추가 (닫기 버튼을 담을 패널)
+  FButtonPanel := TPanel.Create(Self);
+  with FButtonPanel do
+  begin
+    Parent := Self;
+    Align := alBottom;
+    Height := 40;
+    BevelOuter := bvNone;
+
+    // 닫기 버튼을 패널로 이동
+    FCloseButton.Parent := FButtonPanel;
+    FCloseButton.Anchors := [akTop, akRight];
+    FCloseButton.Left := Width - 90;
+    FCloseButton.Top := 5;
   end;
 end;
 
@@ -689,7 +759,7 @@ begin
     Font.Color := clSilver;
 
     // VirtualTreeView 설정
-    Header.Options := [hoColumnResize, hoVisible, hoAutoResize, hoHotTrack];
+    Header.Options := [hoColumnResize, hoVisible, hoHotTrack];
     Header.Height := 20;
 
     // 중요: 전체 행 선택 설정
@@ -708,43 +778,80 @@ begin
 
     // 컬럼 설정
     Header.Columns.Clear;
+
+    // 시간 컬럼 - hh:nn:ss.zzz가 모두 보이도록 충분히 넓게 설정
     with Header.Columns.Add do
     begin
       Text := '시간';
-      Width := 106;
-      Options := Options + [coAllowClick];
+      Width := 105;  // 밀리초까지 보이도록 더 넓게 설정
+      MinWidth := 105;
       Alignment := taLeftJustify;
-      MinWidth := 106;
+      Options := [coAllowClick, coDraggable, coEnabled, coParentBidiMode,
+                  coParentColor, coResizable, coVisible, coFixed];
     end;
+
+    // 레벨 컬럼 - 현재 적당함
     with Header.Columns.Add do
     begin
       Text := '레벨';
-      Width := 70;
-      Options := Options + [coAllowClick];
+      Width := 65;
+      MinWidth := 55;
       Alignment := taLeftJustify;
-      MinWidth := 60;
+      Options := [coAllowClick, coDraggable, coEnabled, coParentBidiMode,
+                  coParentColor, coResizable, coVisible, coFixed];
     end;
-    // 소스 컬럼 추가
+
+    // 소스 컬럼 - 더 좁게 조정
     with Header.Columns.Add do
     begin
       Text := '소스';
-      Width := 120;
-      Options := Options + [coAllowClick];
+      Width := 65;  // 더 좁게 설정
+      MinWidth := 55;
       Alignment := taLeftJustify;
-      MinWidth := 80;
+      Options := [coAllowClick, coDraggable, coEnabled, coParentBidiMode,
+                  coParentColor, coResizable, coVisible, coFixed];
     end;
+
+    // 메시지 컬럼 - 더 넓게
     with Header.Columns.Add do
     begin
       Text := '메시지';
-      Width := 380;  // 메시지 컬럼 너비 증가
-      Options := Options + [coAllowClick];
-      Alignment := taLeftJustify;
+      Width := 440;
       MinWidth := 200;
+      Alignment := taLeftJustify;
+      Options := [coAllowClick, coDraggable, coEnabled, coParentBidiMode,
+                  coParentColor, coResizable, coVisible]; // coFixed 제외
     end;
+
+    // 컬럼 설정 적용
+    Header.AutoSizeIndex := 3; // 메시지 컬럼이 확장되도록 설정
 
     // 노드 라인 높이 설정
     DefaultNodeHeight := 18;
+
+    // 강제 갱신
+    Invalidate;
+
+    // 추가로 컬럼 너비를 초기 설정대로 강제 적용
+    BeginUpdate;
+    try
+      // 각 컬럼의 너비를 명시적으로 설정하고 개별 갱신
+      Header.Columns[0].Width := 105;  // 시간 (밀리초까지 표시)
+      InvalidateColumn(0);
+
+      Header.Columns[1].Width := 65;  // 레벨 (적당함)
+      InvalidateColumn(1);
+
+      Header.Columns[2].Width := 65;  // 소스 (더 좁게)
+      InvalidateColumn(2);
+
+      // 메시지 컬럼은 자동 크기 조정됨
+      InvalidateColumn(3);
+    finally
+      EndUpdate;
+    end;
   end;
+
 
   // 컬럼 가시성 초기 설정
   FColumnVisibility.ShowTimeColumn := True;
@@ -782,6 +889,16 @@ end;
 
 destructor TPrintfLogForm.Destroy;
 begin
+  // 마지막 라인 버퍼 해제
+  SetLength(FLastLineBuffer, 0);
+
+  // 타이머 해제
+  if Assigned(FAutoRefreshTimer) then
+  begin
+    FAutoRefreshTimer.Enabled := False;
+    FreeAndNil(FAutoRefreshTimer);
+  end;
+
   // 원본 노드 리스트 해제
   if Assigned(FOriginalNodes) then
     FOriginalNodes.Free;
@@ -1146,8 +1263,12 @@ end;
 // 소스 통계 관련 메서드
 procedure TPrintfLogForm.AddSourceToList(const SourceStr: string);
 begin
-  if (SourceStr <> '') and (FUniqueSourceList.IndexOf(SourceStr) < 0) then
-    FUniqueSourceList.Add(SourceStr);
+  if (SourceStr <> '') then
+  begin
+    // 이미 목록에 있는지 확인한 후 추가
+    if FUniqueSourceList.IndexOf(SourceStr) < 0 then
+      FUniqueSourceList.Add(SourceStr);
+  end;
 end;
 
 procedure TPrintfLogForm.UpdateSourceStatistics;
@@ -1156,7 +1277,13 @@ var
   Data: PLogData;
   SourceStr: string;
 begin
+  // 기존 코드 대체
+
   // 통계 수집을 위해 모든 노드 순회
+  FUniqueSourceList.Clear; // 기존 목록 초기화
+  FUniqueSourceList.Sorted := True; // 정렬 활성화
+  FUniqueSourceList.Duplicates := dupIgnore; // 중복 무시
+
   Node := FLogTree.GetFirst;
   while Assigned(Node) do
   begin
@@ -1165,7 +1292,11 @@ begin
     begin
       SourceStr := Data^.Source;
       if SourceStr <> '' then
-        AddSourceToList(SourceStr);
+      begin
+        // TStringList.Add 메서드 사용 (인덱스 지정 없음)
+        if FUniqueSourceList.IndexOf(SourceStr) < 0 then
+          FUniqueSourceList.Add(SourceStr);
+      end;
     end;
     Node := FLogTree.GetNext(Node);
   end;
@@ -1181,23 +1312,48 @@ var
   i: Integer;
   SourceStr: string;
   Count, ErrorCount: Integer;
+  TempList: TStringList; // 정렬되지 않은 임시 리스트
 begin
   // 통계 데이터 수집
   SourceCounts := TStringList.Create;
   SourceErrorCounts := TStringList.Create;
+  TempList := TStringList.Create; // 정렬되지 않은 임시 리스트 추가
 
   try
     // 초기 설정
-    SourceCounts.Sorted := True;
-    SourceCounts.Duplicates := dupIgnore;
-    SourceErrorCounts.Sorted := True;
-    SourceErrorCounts.Duplicates := dupIgnore;
+    SourceCounts.Sorted := False; // 정렬 비활성화
+    SourceCounts.Duplicates := dupAccept;
+    SourceErrorCounts.Sorted := False; // 정렬 비활성화
+    SourceErrorCounts.Duplicates := dupAccept;
+
+    // 먼저 모든 고유 소스 수집 (정렬되지 않은 임시 리스트 사용)
+    TempList.Clear;
+    TempList.Sorted := False;
+    TempList.Duplicates := dupIgnore;
+
+    // 모든 소스 수집
+    Node := FLogTree.GetFirst;
+    while Assigned(Node) do
+    begin
+      Data := FLogTree.GetNodeData(Node);
+      if Assigned(Data) then
+      begin
+        SourceStr := Data^.Source;
+        if SourceStr = '' then
+          SourceStr := '(없음)';
+
+        // 소스가 이미 TempList에 있는지 확인
+        if TempList.IndexOf(SourceStr) < 0 then
+          TempList.Add(SourceStr);
+      end;
+      Node := FLogTree.GetNext(Node);
+    end;
 
     // 소스별 카운트 초기화
-    for i := 0 to FUniqueSourceList.Count - 1 do
+    for i := 0 to TempList.Count - 1 do
     begin
-      SourceCounts.Values[FUniqueSourceList[i]] := '0';
-      SourceErrorCounts.Values[FUniqueSourceList[i]] := '0';
+      SourceCounts.Values[TempList[i]] := '0';
+      SourceErrorCounts.Values[TempList[i]] := '0';
     end;
 
     // 로그 항목 분석
@@ -1249,6 +1405,7 @@ begin
   finally
     SourceCounts.Free;
     SourceErrorCounts.Free;
+    TempList.Free; // 임시 리스트 해제
   end;
 end;
 
@@ -2563,6 +2720,14 @@ begin
     ShowSourceStatisticsForm;
     Key := 0;
   end;
+
+  // F5: 새로고침
+  if Key = VK_F5 then
+  begin
+    if FIsFileViewMode and (FLastLoadedFileName <> '') then
+      ReloadLogFile;
+    Key := 0;
+  end;
 end;
 
 // 선택한 로그 복사 메서드 - 소스 정보 포함
@@ -2703,12 +2868,15 @@ var
   SaveDialog: TSaveDialog;
   ActualFileName: string;
   LogFile: TextFile;
+  FileHandle: THandle;
   Node: PVirtualNode;
   Data: PLogData;
   TimeStr, LevelStr, SourceStr, MsgStr: string;
   FilterActive: Boolean;
+  FileStream: TFileStream;
+  TempStream: TMemoryStream;
 begin
-  // 파일 이름 결정 (기존 코드와 동일)
+  // 파일 이름 결정
   if FileName <> '' then
     ActualFileName := FileName
   else
@@ -2733,58 +2901,123 @@ begin
   // 필터 적용 여부 확인
   FilterActive := FIsFileViewMode and FFilterOptions.Enabled;
 
-  // 파일 저장
+  // 파일 저장 시도
   try
-    // 로그 파일 열기
-    AssignFile(LogFile, ActualFileName);
-    Rewrite(LogFile);
-
     try
-      // 모든 로그 항목 저장
-      Node := FLogTree.GetFirst;
-      while Assigned(Node) do
+      // 공유 모드로 파일 생성 시도
+      FileHandle := FileCreate(ActualFileName);
+      if FileHandle > 0 then
       begin
-        // 필터가 활성화된 경우 보이는 노드만 저장
-        if (not FilterActive) or FLogTree.IsVisible[Node] then
-        begin
-          Data := FLogTree.GetNodeData(Node);
-          if Assigned(Data) then
-          begin
-            // 시간, 레벨, 소스, 메시지 가져오기
-            TimeStr := FormatDateTime('yyyy-mm-dd hh:nn:ss.zzz', Data^.Time);
+        FileClose(FileHandle);
 
-            case Data^.Level of
-              llDevelop: LevelStr := 'DEVEL';
-              llDebug:   LevelStr := 'DEBUG';
-              llInfo:    LevelStr := 'INFO';
-              llWarning: LevelStr := 'WARN';
-              llError:   LevelStr := 'ERROR';
-              llFatal:   LevelStr := 'FATAL';
-              else       LevelStr := '???';
+        // 파일 열기
+        AssignFile(LogFile, ActualFileName);
+        Rewrite(LogFile);
+
+        try
+          // 모든 로그 항목 저장
+          Node := FLogTree.GetFirst;
+          while Assigned(Node) do
+          begin
+            // 필터가 활성화된 경우 보이는 노드만 저장
+            if (not FilterActive) or FLogTree.IsVisible[Node] then
+            begin
+              Data := FLogTree.GetNodeData(Node);
+              if Assigned(Data) then
+              begin
+                // 시간, 레벨, 소스, 메시지 가져오기
+                TimeStr := FormatDateTime('yyyy-mm-dd hh:nn:ss.zzz', Data^.Time);
+
+                case Data^.Level of
+                  llDevelop: LevelStr := 'DEVEL';
+                  llDebug:   LevelStr := 'DEBUG';
+                  llInfo:    LevelStr := 'INFO';
+                  llWarning: LevelStr := 'WARN';
+                  llError:   LevelStr := 'ERROR';
+                  llFatal:   LevelStr := 'FATAL';
+                  else       LevelStr := '???';
+                end;
+
+                SourceStr := Data^.Source;
+                MsgStr := Data^.Message;
+
+                // 파일에 쓰기 - 소스 정보 포함
+                if SourceStr <> '' then
+                  WriteLn(LogFile, Format('[%s] [%s] [%s] %s', [TimeStr, LevelStr, SourceStr, MsgStr]))
+                else
+                  WriteLn(LogFile, Format('[%s] [%s] %s', [TimeStr, LevelStr, MsgStr]));
+              end;
             end;
 
-            SourceStr := Data^.Source;
-            MsgStr := Data^.Message;
-
-            // 파일에 쓰기 - 소스 정보 포함
-            if SourceStr <> '' then
-              WriteLn(LogFile, Format('[%s] [%s] [%s] %s', [TimeStr, LevelStr, SourceStr, MsgStr]))
-            else
-              WriteLn(LogFile, Format('[%s] [%s] %s', [TimeStr, LevelStr, MsgStr]));
+            Node := FLogTree.GetNextSibling(Node);
           end;
+
+          // 저장 성공 메시지
+          if FilterActive then
+            StatusBar.Panels[0].Text := Format('필터링된 로그 저장 완료: %s', [ExtractFileName(ActualFileName)])
+          else
+            StatusBar.Panels[0].Text := Format('파일 저장 완료: %s', [ExtractFileName(ActualFileName)]);
+        finally
+          CloseFile(LogFile);
         end;
-
-        Node := FLogTree.GetNextSibling(Node);
       end;
+    except
+      on E: Exception do
+      begin
+        // 일반적인 방법으로 저장 실패 시 대체 방법 시도
+        try
+          // TStringList로 저장 시도
+          with TStringList.Create do
+          try
+            Node := FLogTree.GetFirst;
+            while Assigned(Node) do
+            begin
+              // 필터가 활성화된 경우 보이는 노드만 저장
+              if (not FilterActive) or FLogTree.IsVisible[Node] then
+              begin
+                Data := FLogTree.GetNodeData(Node);
+                if Assigned(Data) then
+                begin
+                  // 시간, 레벨, 소스, 메시지 가져오기
+                  TimeStr := FormatDateTime('yyyy-mm-dd hh:nn:ss.zzz', Data^.Time);
 
-      // 저장 성공 메시지
-      if FilterActive then
-        StatusBar.Panels[0].Text := Format('필터링된 로그 저장 완료: %s', [ExtractFileName(ActualFileName)])
-      else
-        StatusBar.Panels[0].Text := Format('파일 저장 완료: %s', [ExtractFileName(ActualFileName)]);
-    finally
-      // 파일 닫기
-      CloseFile(LogFile);
+                  case Data^.Level of
+                    llDevelop: LevelStr := 'DEVEL';
+                    llDebug:   LevelStr := 'DEBUG';
+                    llInfo:    LevelStr := 'INFO';
+                    llWarning: LevelStr := 'WARN';
+                    llError:   LevelStr := 'ERROR';
+                    llFatal:   LevelStr := 'FATAL';
+                    else       LevelStr := '???';
+                  end;
+
+                  SourceStr := Data^.Source;
+                  MsgStr := Data^.Message;
+
+                  // 파일에 쓰기 - 소스 정보 포함
+                  if SourceStr <> '' then
+                    Add(Format('[%s] [%s] [%s] %s', [TimeStr, LevelStr, SourceStr, MsgStr]))
+                  else
+                    Add(Format('[%s] [%s] %s', [TimeStr, LevelStr, MsgStr]));
+                end;
+              end;
+
+              Node := FLogTree.GetNextSibling(Node);
+            end;
+
+            // 파일 저장
+            SaveToFile(ActualFileName);
+
+            StatusBar.Panels[0].Text := Format('파일 저장 완료(대체 방법): %s', [ExtractFileName(ActualFileName)]);
+          finally
+            Free;
+          end;
+        except
+          on E2: Exception do
+            // 저장 실패 메시지
+            StatusBar.Panels[0].Text := '파일 저장 실패: ' + E2.Message;
+        end;
+      end;
     end;
   except
     on E: Exception do
@@ -2811,6 +3044,10 @@ var
   Data: PLogData;
   TimeStart, TimeEnd, LevelStart, LevelEnd, SourceStart, SourceEnd, MsgStart: Integer;
   IsValidTimeFormat, IsValidLevelFormat: Boolean;
+  TempFileName: string;
+  FileStream: TFileStream;
+  TempStream: TMemoryStream;
+  FileHandle: THandle;
 begin
   // 기존 로그 지우기
   FLogTree.Clear;
@@ -2825,165 +3062,945 @@ begin
   end;
 
   try
-    // 파일 열기
-    AssignFile(LogFile, FileName);
-    Reset(LogFile);
+    // 먼저 공유 모드로 파일을 열기 시도
+    try
+      // 공유 읽기 모드로 파일 열기 시도
+      FileStream := TFileStream.Create(FileName, fmOpenRead or fmShareDenyNone);
+      try
+        // 파일 핸들 획득 성공, 일반적인 방법으로 처리 진행
+        AssignFile(LogFile, FileName);
+        Reset(LogFile);
 
-    // 파일의 각 라인 처리
-    while not Eof(LogFile) do
-    begin
-      ReadLn(LogFile, Line);
-
-      // 로그 라인 파싱
-      TimeStr := '';
-      LevelStr := '';
-      SourceStr := '';
-      MsgStr := Line;  // 기본값은 전체 라인
-      IsValidTimeFormat := False;
-      IsValidLevelFormat := False;
-
-      // [시간] [레벨] [소스] 메시지 형식 파싱
-      TimeStart := Pos('[', Line);
-      if TimeStart > 0 then
-      begin
-        TimeEnd := Pos(']', Line, TimeStart);
-        if TimeEnd > TimeStart then
+        // 파일의 각 라인 처리
+        while not Eof(LogFile) do
         begin
-          TimeStr := Copy(Line, TimeStart + 1, TimeEnd - TimeStart - 1);
+          ReadLn(LogFile, Line);
 
-          // 시간 형식 검증 - 날짜/시간 형식인지 확인
-          IsValidTimeFormat := IsValidDateTimeFormat(TimeStr);
+          // 로그 라인 파싱
+          TimeStr := '';
+          LevelStr := '';
+          SourceStr := '';
+          MsgStr := Line;  // 기본값은 전체 라인
+          IsValidTimeFormat := False;
+          IsValidLevelFormat := False;
 
-          if IsValidTimeFormat then  // 유효한 시간 형식일 경우에만 계속 파싱
+          // [시간] [레벨] [소스] 메시지 형식 파싱
+          TimeStart := Pos('[', Line);
+          if TimeStart > 0 then
           begin
-            // 레벨 정보 파싱
-            LevelStart := Pos('[', Line, TimeEnd);
-            if LevelStart > 0 then
+            TimeEnd := Pos(']', Line, TimeStart);
+            if TimeEnd > TimeStart then
             begin
-              LevelEnd := Pos(']', Line, LevelStart);
-              if LevelEnd > LevelStart then
+              TimeStr := Copy(Line, TimeStart + 1, TimeEnd - TimeStart - 1);
+
+              // 시간 형식 검증 - 날짜/시간 형식인지 확인
+              IsValidTimeFormat := IsValidDateTimeFormat(TimeStr);
+
+              if IsValidTimeFormat then  // 유효한 시간 형식일 경우에만 계속 파싱
               begin
-                LevelStr := Copy(Line, LevelStart + 1, LevelEnd - LevelStart - 1);
-
-                // 레벨 형식 검증 - 알려진 로그 레벨인지 확인
-                IsValidLevelFormat := IsValidLogLevel(LevelStr);
-
-                if IsValidLevelFormat then  // 유효한 레벨 형식일 경우에만 계속 파싱
+                // 레벨 정보 파싱
+                LevelStart := Pos('[', Line, TimeEnd);
+                if LevelStart > 0 then
                 begin
-                  // 소스 정보 파싱 (있을 경우)
-                  SourceStart := Pos('[', Line, LevelEnd);
-                  if SourceStart > 0 then
+                  LevelEnd := Pos(']', Line, LevelStart);
+                  if LevelEnd > LevelStart then
                   begin
-                    SourceEnd := Pos(']', Line, SourceStart);
-                    if SourceEnd > SourceStart then
+                    LevelStr := Copy(Line, LevelStart + 1, LevelEnd - LevelStart - 1);
+
+                    // 레벨 형식 검증 - 알려진 로그 레벨인지 확인
+                    IsValidLevelFormat := IsValidLogLevel(LevelStr);
+
+                    if IsValidLevelFormat then  // 유효한 레벨 형식일 경우에만 계속 파싱
                     begin
-                      SourceStr := Copy(Line, SourceStart + 1, SourceEnd - SourceStart - 1);
-                      MsgStart := SourceEnd + 1;
+                      // 소스 정보 파싱 (있을 경우)
+                      SourceStart := Pos('[', Line, LevelEnd);
+                      if SourceStart > 0 then
+                      begin
+                        SourceEnd := Pos(']', Line, SourceStart);
+                        if SourceEnd > SourceStart then
+                        begin
+                          SourceStr := Copy(Line, SourceStart + 1, SourceEnd - SourceStart - 1);
+                          MsgStart := SourceEnd + 1;
+                        end
+                        else
+                          MsgStart := LevelEnd + 1;
+                      end
+                      else
+                        MsgStart := LevelEnd + 1;
+
+                      // 메시지 부분 파싱
+                      if MsgStart <= Length(Line) then
+                        MsgStr := Trim(Copy(Line, MsgStart, Length(Line)));
                     end
                     else
-                      MsgStart := LevelEnd + 1;
-                  end
-                  else
-                    MsgStart := LevelEnd + 1;
+                    begin
+                      // 레벨 형식이 아니면 원본 라인 사용
+                      LevelStr := '';
+                      MsgStr := Line;
+                    end;
+                  end;
+                end;
+              end
+              else
+              begin
+                // 시간 형식이 아니면 원본 라인 사용
+                TimeStr := '';
+                MsgStr := Line;
+              end;
+            end;
+          end;
 
-                  // 메시지 부분 파싱
-                  if MsgStart <= Length(Line) then
-                    MsgStr := Trim(Copy(Line, MsgStart, Length(Line)));
-                end
-                else
-                begin
-                  // 레벨 형식이 아니면 원본 라인 사용
-                  LevelStr := '';
-                  MsgStr := Line;
+          // 노드 추가
+          Node := FLogTree.AddChild(nil);
+          Data := FLogTree.GetNodeData(Node);
+          if Assigned(Data) then
+          begin
+            // 파싱에 성공한 경우
+            if IsValidTimeFormat and IsValidLevelFormat then
+            begin
+              Data^.Message := MsgStr;  // 메시지 부분 저장
+              Data^.Source := SourceStr; // 소스 정보 저장
+
+              // 소스가 있으면 고유 소스 목록에 추가
+              if SourceStr <> '' then
+                AddSourceToList(SourceStr);
+
+              // 레벨 설정
+              Data^.Level := StringToLogLevel(LevelStr);
+
+              // 시간 설정
+              try
+                Data^.Time := StrToDateTime(TimeStr);
+              except
+                Data^.Time := Now;
+              end;
+            end
+            else
+            begin
+              // 파싱 실패한 경우 - 기본 구분자 기반 파싱 시도
+              if not ParseLogLineBasic(Line, TimeStr, LevelStr, SourceStr, MsgStr) then
+              begin
+                // 파싱 실패 - 전체 라인을 메시지로 처리
+                Data^.Message := Line;
+                Data^.Source := '';
+                Data^.Level := llInfo; // 기본값
+                Data^.Time := Now;
+              end
+              else
+              begin
+                // 기본 파싱 성공
+                Data^.Message := MsgStr;
+                Data^.Source := SourceStr;
+                if SourceStr <> '' then
+                  AddSourceToList(SourceStr);
+                Data^.Level := StringToLogLevel(LevelStr);
+                try
+                  if TimeStr <> '' then
+                    Data^.Time := StrToDateTime(TimeStr)
+                  else
+                    Data^.Time := Now;
+                except
+                  Data^.Time := Now;
                 end;
               end;
             end;
-          end
-          else
-          begin
-            // 시간 형식이 아니면 원본 라인 사용
-            TimeStr := '';
-            MsgStr := Line;
           end;
         end;
+
+        // 파일 닫기
+        CloseFile(LogFile);
+      finally
+        FileStream.Free;
       end;
-
-      // 노드 추가
-      Node := FLogTree.AddChild(nil);
-      Data := FLogTree.GetNodeData(Node);
-      if Assigned(Data) then
+    except
+      on E: Exception do
       begin
-        // 파싱에 성공한 경우
-        if IsValidTimeFormat and IsValidLevelFormat then
-        begin
-          Data^.Message := MsgStr;  // 메시지 부분 저장
-          Data^.Source := SourceStr; // 소스 정보 저장
-
-          // 소스가 있으면 고유 소스 목록에 추가
-          if SourceStr <> '' then
-            AddSourceToList(SourceStr);
-
-          // 레벨 설정
-          Data^.Level := StringToLogLevel(LevelStr);
-
-          // 시간 설정
+        // 공유 모드로 열기 실패 - 파일이 잠겨 있음
+        // 임시 파일로 복사 후 처리
+        TempFileName := GetTempDir + 'temp_log_' + FormatDateTime('hhnnsszzz', Now) + '.log';
+        TempStream := TMemoryStream.Create;
+        try
+          // 임시 복사본 생성 (메모리 스트림 사용)
           try
-            Data^.Time := StrToDateTime(TimeStr);
+            // Windows API를 사용하여 파일 열기
+            FileHandle := FileOpen(FileName, fmOpenRead or fmShareDenyNone);
+
+            if FileHandle <> THandle(-1) then
+            begin
+              try
+                FileStream := TFileStream.Create(FileName, fmOpenRead or fmShareDenyNone);
+                try
+                  TempStream.CopyFrom(FileStream, 0);
+                  TempStream.Position := 0;
+
+                  // 임시 파일로 저장
+                  TempStream.SaveToFile(TempFileName);
+                finally
+                  FileStream.Free;
+                end;
+              finally
+                FileClose(FileHandle);
+              end;
+
+              // 임시 파일로부터 읽기
+              AssignFile(LogFile, TempFileName);
+              Reset(LogFile);
+
+              // 임시 파일의 각 라인 처리
+              while not Eof(LogFile) do
+              begin
+                ReadLn(LogFile, Line);
+
+                // 로그 라인 파싱
+                TimeStr := '';
+                LevelStr := '';
+                SourceStr := '';
+                MsgStr := Line;  // 기본값은 전체 라인
+                IsValidTimeFormat := False;
+                IsValidLevelFormat := False;
+
+                // [시간] [레벨] [소스] 메시지 형식 파싱
+                TimeStart := Pos('[', Line);
+                if TimeStart > 0 then
+                begin
+                  TimeEnd := Pos(']', Line, TimeStart);
+                  if TimeEnd > TimeStart then
+                  begin
+                    TimeStr := Copy(Line, TimeStart + 1, TimeEnd - TimeStart - 1);
+
+                    // 시간 형식 검증 - 날짜/시간 형식인지 확인
+                    IsValidTimeFormat := IsValidDateTimeFormat(TimeStr);
+
+                    if IsValidTimeFormat then  // 유효한 시간 형식일 경우에만 계속 파싱
+                    begin
+                      // 레벨 정보 파싱
+                      LevelStart := Pos('[', Line, TimeEnd);
+                      if LevelStart > 0 then
+                      begin
+                        LevelEnd := Pos(']', Line, LevelStart);
+                        if LevelEnd > LevelStart then
+                        begin
+                          LevelStr := Copy(Line, LevelStart + 1, LevelEnd - LevelStart - 1);
+
+                          // 레벨 형식 검증 - 알려진 로그 레벨인지 확인
+                          IsValidLevelFormat := IsValidLogLevel(LevelStr);
+
+                          if IsValidLevelFormat then  // 유효한 레벨 형식일 경우에만 계속 파싱
+                          begin
+                            // 소스 정보 파싱 (있을 경우)
+                            SourceStart := Pos('[', Line, LevelEnd);
+                            if SourceStart > 0 then
+                            begin
+                              SourceEnd := Pos(']', Line, SourceStart);
+                              if SourceEnd > SourceStart then
+                              begin
+                                SourceStr := Copy(Line, SourceStart + 1, SourceEnd - SourceStart - 1);
+                                MsgStart := SourceEnd + 1;
+                              end
+                              else
+                                MsgStart := LevelEnd + 1;
+                            end
+                            else
+                              MsgStart := LevelEnd + 1;
+
+                            // 메시지 부분 파싱
+                            if MsgStart <= Length(Line) then
+                              MsgStr := Trim(Copy(Line, MsgStart, Length(Line)));
+                          end
+                          else
+                          begin
+                            // 레벨 형식이 아니면 원본 라인 사용
+                            LevelStr := '';
+                            MsgStr := Line;
+                          end;
+                        end;
+                      end;
+                    end
+                    else
+                    begin
+                      // 시간 형식이 아니면 원본 라인 사용
+                      TimeStr := '';
+                      MsgStr := Line;
+                    end;
+                  end;
+                end;
+
+                // 노드 추가
+                Node := FLogTree.AddChild(nil);
+                Data := FLogTree.GetNodeData(Node);
+                if Assigned(Data) then
+                begin
+                  // 파싱에 성공한 경우
+                  if IsValidTimeFormat and IsValidLevelFormat then
+                  begin
+                    Data^.Message := MsgStr;  // 메시지 부분 저장
+                    Data^.Source := SourceStr; // 소스 정보 저장
+
+                    // 소스가 있으면 고유 소스 목록에 추가
+                    if SourceStr <> '' then
+                      AddSourceToList(SourceStr);
+
+                    // 레벨 설정
+                    Data^.Level := StringToLogLevel(LevelStr);
+
+                    // 시간 설정
+                    try
+                      Data^.Time := StrToDateTime(TimeStr);
+                    except
+                      Data^.Time := Now;
+                    end;
+                  end
+                  else
+                  begin
+                    // 파싱 실패한 경우 - 기본 구분자 기반 파싱 시도
+                    if not ParseLogLineBasic(Line, TimeStr, LevelStr, SourceStr, MsgStr) then
+                    begin
+                      // 파싱 실패 - 전체 라인을 메시지로 처리
+                      Data^.Message := Line;
+                      Data^.Source := '';
+                      Data^.Level := llInfo; // 기본값
+                      Data^.Time := Now;
+                    end
+                    else
+                    begin
+                      // 기본 파싱 성공
+                      Data^.Message := MsgStr;
+                      Data^.Source := SourceStr;
+                      if SourceStr <> '' then
+                        AddSourceToList(SourceStr);
+                      Data^.Level := StringToLogLevel(LevelStr);
+                      try
+                        if TimeStr <> '' then
+                          Data^.Time := StrToDateTime(TimeStr)
+                        else
+                          Data^.Time := Now;
+                      except
+                        Data^.Time := Now;
+                      end;
+                    end;
+                  end;
+                end;
+              end;
+
+              // 임시 파일 닫기
+              CloseFile(LogFile);
+              SysUtils.DeleteFile(TempFileName);
+            end
+            else
+            begin
+              // 파일 열기 실패
+              StatusBar.Panels[0].Text := '현재 로그 파일에 접근할 수 없습니다: ' + SysErrorMessage(GetLastError);
+            end;
           except
-            Data^.Time := Now;
-          end;
-        end
-        else
-        {
-          // 파싱 실패한 경우 - 전체 라인을 메시지로 처리
-          Data^.Message := Line;
-          Data^.Source := '';
-          Data^.Level := llInfo; // 기본값
-          Data^.Time := Now;
-        }
-        begin
-          // 파싱 실패한 경우 - 기본 구분자 기반 파싱 시도
-          if not ParseLogLineBasic(Line, TimeStr, LevelStr, SourceStr, MsgStr) then
-          begin
-            // 파싱 실패 - 전체 라인을 메시지로 처리
-            Data^.Message := Line;
-            Data^.Source := '';
-            Data^.Level := llInfo; // 기본값
-            Data^.Time := Now;
-          end
-          else
-          begin
-            // 기본 파싱 성공
-            Data^.Message := MsgStr;
-            Data^.Source := SourceStr;
-            if SourceStr <> '' then
-              AddSourceToList(SourceStr);
-            Data^.Level := StringToLogLevel(LevelStr);
-            try
-              if TimeStr <> '' then
-                Data^.Time := StrToDateTime(TimeStr)
-              else
-                Data^.Time := Now;
-            except
-              Data^.Time := Now;
+            on E2: Exception do
+            begin
+              StatusBar.Panels[0].Text := '현재 로그 파일에 접근할 수 없습니다: ' + E2.Message;
             end;
           end;
+        finally
+          TempStream.Free;
+          if FileExists(TempFileName) then
+            SysUtils.DeleteFile(TempFileName);
         end;
       end;
     end;
 
-    // 파일 닫기
-    CloseFile(LogFile);
+    // 파일 크기 및 수정 시간 저장
+    FileHandle := FileOpen(FileName, fmOpenRead or fmShareDenyNone);
+    if FileHandle <> THandle(-1) then
+    begin
+      try
+        FLastFileSize := FileSeek(FileHandle, 0, soFromEnd);
+        // 파일 수정 시간 저장
+        FLastFileModified := FileDateToDateTime(FileAge(FileName));
+      finally
+        FileClose(FileHandle);
+      end;
+    end;
 
     // 상태바 업데이트
     StatusBar.Panels[0].Text := Format('로그 파일 로드됨: %s (%d 항목)',
-                                     [ExtractFileName(FileName), FLogTree.TotalCount]);
+                                   [ExtractFileName(FileName), FLogTree.TotalCount]);
+
+    // 로드된 파일명 저장
+    FLastLoadedFileName := FileName;
   except
     on E: Exception do
       ShowMessage('로그 파일 로드 중 오류 발생: ' + E.Message);
   end;
+
+  // 파일 정보 업데이트
+  UpdateFileInfo(FileName);
+
+  //// 모든 코드 실행 후 항상 파일 크기와 시간 저장
+  //if FileExists(FileName) then
+  //begin
+  //  try
+  //    FileHandle := FileOpen(FileName, fmOpenRead or fmShareDenyNone);
+  //    if FileHandle <> THandle(-1) then
+  //    begin
+  //      try
+  //        FLastFileSize := FileSeek(FileHandle, 0, soFromEnd);
+  //        FLastFileModified := FileDateToDateTime(FileAge(FileName));
+  //      finally
+  //        FileClose(FileHandle);
+  //      end;
+  //    end;
+  //  except
+  //    // 파일 정보 가져오기 실패 시 무시
+  //  end;
+  //end;
 end;
 
+// 자동 새로고침 메뉴 추가
+procedure TPrintfLogForm.AddAutoRefreshMenuItem;
+var
+  PopupMenu1: TPopupMenu;
+  MenuItem, SubMenuItem: TMenuItem;
+  i: Integer;
+  RefreshRates: array[0..5] of Integer = (500, 1000, 2000, 5000, 10000, 30000);
+  RefreshLabels: array[0..5] of string = ('0.5초', '1초', '2초', '5초', '10초', '30초');
+begin
+  // 기존 팝업 메뉴 가져오기
+  PopupMenu1 := FLogTree.PopupMenu;
+  if not Assigned(PopupMenu1) then
+    Exit;
+
+  // 구분선 추가
+  MenuItem := TMenuItem.Create(PopupMenu1);
+  MenuItem.Caption := '-';
+  PopupMenu1.Items.Add(MenuItem);
+
+  // 자동 새로고침 메뉴 추가
+  MenuItem := TMenuItem.Create(PopupMenu1);
+  MenuItem.Caption := '자동 새로고침';
+  MenuItem.Tag := 10; // 새로고침 태그
+
+  // 새로고침 간격 서브메뉴
+  for i := 0 to 5 do
+  begin
+    SubMenuItem := TMenuItem.Create(MenuItem);
+    SubMenuItem.Caption := RefreshLabels[i];
+    SubMenuItem.Tag := RefreshRates[i];
+    SubMenuItem.RadioItem := True;
+    SubMenuItem.OnClick := @OnAutoRefreshMenuClick;
+
+    if RefreshRates[i] = FAutoRefreshInterval then
+      SubMenuItem.Checked := True;
+
+    MenuItem.Add(SubMenuItem);
+  end;
+
+  // 사용 안함 옵션
+  SubMenuItem := TMenuItem.Create(MenuItem);
+  SubMenuItem.Caption := '-';
+  MenuItem.Add(SubMenuItem);
+
+  SubMenuItem := TMenuItem.Create(MenuItem);
+  SubMenuItem.Caption := '사용 안함';
+  SubMenuItem.Tag := 0;
+  SubMenuItem.RadioItem := True;
+  SubMenuItem.Checked := not FAutoRefreshEnabled;
+  SubMenuItem.OnClick := @OnAutoRefreshMenuClick;
+  MenuItem.Add(SubMenuItem);
+
+  // 스크롤 위치 유지 옵션
+  SubMenuItem := TMenuItem.Create(MenuItem);
+  SubMenuItem.Caption := '-';
+  MenuItem.Add(SubMenuItem);
+
+  SubMenuItem := TMenuItem.Create(MenuItem);
+  SubMenuItem.Caption := '스크롤 위치 유지';
+  SubMenuItem.Tag := -2;
+  SubMenuItem.Checked := FPreserveScrollPos;
+  SubMenuItem.OnClick := @OnPreserveScrollPosClick;
+  MenuItem.Add(SubMenuItem);
+
+  // 지금 새로고침 옵션
+  SubMenuItem := TMenuItem.Create(MenuItem);
+  SubMenuItem.Caption := '-';
+  MenuItem.Add(SubMenuItem);
+
+  SubMenuItem := TMenuItem.Create(MenuItem);
+  SubMenuItem.Caption := '지금 새로고침 (F5)';
+  SubMenuItem.Tag := -1;
+  SubMenuItem.OnClick := @OnManualRefreshClick;
+  MenuItem.Add(SubMenuItem);
+
+  // 메인 메뉴에 추가
+  PopupMenu1.Items.Add(MenuItem);
+end;
+
+// 스크롤 위치 유지 옵션 클릭 이벤트
+procedure TPrintfLogForm.OnPreserveScrollPosClick(Sender: TObject);
+var
+  MenuItem: TMenuItem;
+begin
+  if not (Sender is TMenuItem) then
+    Exit;
+
+  MenuItem := TMenuItem(Sender);
+  FPreserveScrollPos := not FPreserveScrollPos;
+  MenuItem.Checked := FPreserveScrollPos;
+
+  if FPreserveScrollPos then
+    StatusBar.Panels[0].Text := '새로고침 시 현재 스크롤 위치 유지'
+  else
+    StatusBar.Panels[0].Text := '새로고침 시 마지막으로 스크롤';
+end;
+
+// 자동 새로고침 메뉴 클릭 이벤트
+procedure TPrintfLogForm.OnAutoRefreshMenuClick(Sender: TObject);
+var
+  MenuItem: TMenuItem;
+  Interval: Integer;
+begin
+  if not (Sender is TMenuItem) then
+    Exit;
+
+  MenuItem := TMenuItem(Sender);
+  Interval := MenuItem.Tag;
+
+  if Interval > 0 then
+  begin
+    // 간격 설정 및 타이머 활성화
+    FAutoRefreshInterval := Interval;
+    FAutoRefreshTimer.Interval := Interval;
+    FAutoRefreshEnabled := True;
+
+    // 첫 새로고침 설정 초기화
+    FFirstRefreshDone := False;
+    FSkipNextRefresh := True; // 다음 새로고침은 건너뛰기
+
+    // 타이머 시작
+    FAutoRefreshTimer.Enabled := True;
+
+    StatusBar.Panels[0].Text := Format('자동 새로고침 설정: %d ms', [Interval]);
+  end
+  else
+  begin
+    // 타이머 비활성화
+    FAutoRefreshEnabled := False;
+    FAutoRefreshTimer.Enabled := False;
+
+    StatusBar.Panels[0].Text := '자동 새로고침 비활성화됨';
+  end;
+
+  // 메뉴 항목 체크 상태 업데이트
+  UpdateAutoRefreshMenuChecks(Interval);
+end;
+
+// 메뉴 항목 체크 상태 업데이트
+procedure TPrintfLogForm.UpdateAutoRefreshMenuChecks(SelectedInterval: Integer);
+var
+  PopupMenu1: TPopupMenu;
+  MenuItem, SubMenuItem: TMenuItem;
+  i, j: Integer;
+begin
+  PopupMenu1 := FLogTree.PopupMenu;
+  if not Assigned(PopupMenu1) then
+    Exit;
+
+  // 자동 새로고침 메뉴 찾기
+  for i := 0 to PopupMenu1.Items.Count - 1 do
+  begin
+    MenuItem := PopupMenu1.Items[i];
+    if MenuItem.Tag = 10 then // 새로고침 태그로 식별
+    begin
+      // 서브메뉴 체크 상태 업데이트
+      for j := 0 to MenuItem.Count - 1 do
+      begin
+        SubMenuItem := MenuItem.Items[j];
+        if SubMenuItem.RadioItem then // 라디오 항목만 체크 상태 변경
+        begin
+          SubMenuItem.Checked := (SubMenuItem.Tag = SelectedInterval);
+        end;
+      end;
+      Break;
+    end;
+  end;
+end;
+
+// 타이머 이벤트 핸들러
+procedure TPrintfLogForm.OnAutoRefreshTimer(Sender: TObject);
+begin
+  if FIsFileViewMode and FAutoRefreshEnabled and (FLastLoadedFileName <> '') then
+  begin
+    // 첫 번째 새로고침 건너뛰기
+    if FSkipNextRefresh then
+    begin
+      FSkipNextRefresh := False;
+      StatusBar.Panels[0].Text := Format('첫 새로고침 초기화 중... (%s)',
+                                       [FormatDateTime('hh:nn:ss', Now)]);
+
+      // 현재 파일 정보 갱신 (비교 기준점 설정)
+      UpdateFileInfo(FLastLoadedFileName);
+      Exit;
+    end;
+
+    ReloadLogFile;
+  end;
+end;
+
+// 파일 정보 갱신
+procedure TPrintfLogForm.UpdateFileInfo(const FileName: string);
+var
+  FileHandle: THandle;
+begin
+  if not FileExists(FileName) then
+    Exit;
+
+  try
+    FileHandle := FileOpen(FileName, fmOpenRead or fmShareDenyNone);
+    if FileHandle <> THandle(-1) then
+    begin
+      try
+        FLastFileSize := FileSeek(FileHandle, 0, soFromEnd);
+        FLastFileModified := FileDateToDateTime(FileAge(FileName));
+      finally
+        FileClose(FileHandle);
+      end;
+    end;
+  except
+    // 파일 정보 가져오기 실패 시 무시
+  end;
+end;
+
+// 파일 속성 변경 확인
+function TPrintfLogForm.HasFileAttributesChanged(const FileName: string): Boolean;
+var
+  FileHandle: THandle;
+  CurrentSize: Int64;
+  CurrentModified: TDateTime;
+begin
+  Result := False;
+
+  if not FileExists(FileName) then
+    Exit;
+
+  try
+    FileHandle := FileOpen(FileName, fmOpenRead or fmShareDenyNone);
+    if FileHandle <> THandle(-1) then
+    begin
+      try
+        CurrentSize := FileSeek(FileHandle, 0, soFromEnd);
+        CurrentModified := FileDateToDateTime(FileAge(FileName));
+
+        // 파일 크기나 수정 시간이 변경되었는지 확인
+        Result := (CurrentSize <> FLastFileSize) or
+                 (Abs(CurrentModified - FLastFileModified) > 0.000001);
+
+        // 변경되었다면 정보 업데이트
+        if Result then
+        begin
+          FLastFileSize := CurrentSize;
+          FLastFileModified := CurrentModified;
+        end;
+      finally
+        FileClose(FileHandle);
+      end;
+    end;
+  except
+    // 오류 발생 시 변경된 것으로 간주
+    Result := True;
+  end;
+end;
+
+// 수동 새로고침 메뉴 클릭 이벤트
+procedure TPrintfLogForm.OnManualRefreshClick(Sender: TObject);
+begin
+  if FIsFileViewMode and (FLastLoadedFileName <> '') then
+  begin
+    ReloadLogFile;
+    StatusBar.Panels[0].Text := '로그 파일 새로고침 완료: ' +
+                               FormatDateTime('hh:nn:ss', Now);
+  end;
+end;
+
+// 파일 변경 감지 함수 - 파일 끝 부분만 읽어서 비교
+// 파일 변경 감지 함수 - 파일 끝 부분만 읽어서 비교
+function TPrintfLogForm.HasFileContentChanged(const FileName: string): Boolean;
+const
+  MAX_LINES_TO_CHECK = 20;       // 확인할 마지막 줄 수
+  MAX_BUFFER_SIZE = 32 * 1024;   // 읽을 최대 버퍼 크기 (32KB)
+  FULL_READ_THRESHOLD = 3 * 1024 * 1024; // 3MB 이상은 끝부분만 읽기
+var
+  FileHandle: THandle;
+  FileSize: Int64;
+  CurrentModified: TDateTime;
+  LineBuffer: array[0..MAX_LINES_TO_CHECK-1] of string;
+  LineCount, i: Integer;
+  FileStream: TFileStream;
+  TempFileName: string;
+  LogFile: TextFile;
+  Buffer: array[0..MAX_BUFFER_SIZE-1] of Byte;
+  BytesRead: Integer;
+  CurrentLine: string;
+  LastLinesEqual: Boolean;
+  FileAge: Integer;
+begin
+  Result := True; // 기본값: 변경되었다고 가정
+
+  if not FileExists(FileName) then
+    Exit;
+
+  // 파일 크기와 수정 시간 확인 (빠른 체크)
+  try
+    FileHandle := FileOpen(FileName, fmOpenRead or fmShareDenyNone);
+    if FileHandle <> THandle(-1) then
+    begin
+      try
+        FileSize := FileSeek(FileHandle, 0, soFromEnd);
+        FileAge := SysUtils.FileAge(FileName);
+        if FileAge <> -1 then
+          CurrentModified := FileDateToDateTime(FileAge)
+        else
+          CurrentModified := Now;
+
+        // 파일 크기와 수정 시간이 같으면 변경 없음으로 처리
+        if (FileSize = FLastFileSize) and
+           (Abs(CurrentModified - FLastFileModified) < 0.000001) then
+        begin
+          Result := False;
+          Exit;
+        end;
+
+        // 정보 업데이트
+        FLastFileSize := FileSize;
+        FLastFileModified := CurrentModified;
+      finally
+        FileClose(FileHandle);
+      end;
+    end;
+  except
+    on E: Exception do
+    begin
+      // 파일 정보 가져오기 실패 - 변경된 것으로 간주
+      Exit(True);
+    end;
+  end;
+
+  // 대용량 파일이면 내용 끝부분만 임시 파일에 복사해서 읽기
+  try
+    // 1. 먼저 파일의 일부를 읽어서 임시 파일로 저장
+    if FileSize > FULL_READ_THRESHOLD then
+    begin
+      FileStream := TFileStream.Create(FileName, fmOpenRead or fmShareDenyNone);
+      try
+        // 파일 끝부분을 읽기 위해 위치 조정
+        if FileStream.Size > MAX_BUFFER_SIZE then
+          FileStream.Position := FileStream.Size - MAX_BUFFER_SIZE;
+
+        // 버퍼에 읽기
+        BytesRead := FileStream.Read(Buffer, SizeOf(Buffer));
+
+        // 임시 파일로 저장
+        TempFileName := GetTempDir + 'temp_log_tail_' + FormatDateTime('hhnnsszzz', Now) + '.log';
+
+        with TFileStream.Create(TempFileName, fmCreate) do
+        try
+          Write(Buffer, BytesRead);
+        finally
+          Free;
+        end;
+      finally
+        FileStream.Free;
+      end;
+    end
+    else
+      TempFileName := FileName; // 작은 파일은 원본 사용
+
+    // 2. 임시 파일이나 원본 파일을 라인 단위로 읽기
+    try
+      AssignFile(LogFile, TempFileName);
+      Reset(LogFile);
+
+      // 링 버퍼 초기화
+      for i := 0 to MAX_LINES_TO_CHECK-1 do
+        LineBuffer[i] := '';
+
+      // 파일 라인들을 읽어서 마지막 N줄 저장
+      LineCount := 0;
+      while not Eof(LogFile) do
+      begin
+        ReadLn(LogFile, CurrentLine);
+        LineBuffer[LineCount mod MAX_LINES_TO_CHECK] := CurrentLine;
+        Inc(LineCount);
+      end;
+
+      CloseFile(LogFile);
+
+      // 3. 이전에 저장된 마지막 줄들과 비교
+      if Length(FLastLineBuffer) > 0 then
+      begin
+        LastLinesEqual := True;
+
+        // 줄 수가 다르면 내용이 변경된 것
+        if LineCount < Length(FLastLineBuffer) then
+          LastLinesEqual := False
+        else
+        begin
+          // 마지막 N줄 비교
+          for i := 0 to Min(MAX_LINES_TO_CHECK, Length(FLastLineBuffer))-1 do
+          begin
+            if i >= LineCount then
+              Break;
+
+            // 시간 컬럼 등을 포함한 전체 라인 비교
+            if LineBuffer[(LineCount - i - 1) mod MAX_LINES_TO_CHECK] <>
+               FLastLineBuffer[i] then
+            begin
+              LastLinesEqual := False;
+              Break;
+            end;
+          end;
+        end;
+
+        // 마지막 N줄이 같으면 변경 없음으로 판단
+        if LastLinesEqual then
+          Result := False;
+      end;
+
+      // 4. 현재 마지막 줄 저장 (다음 비교를 위해)
+      SetLength(FLastLineBuffer, Min(LineCount, MAX_LINES_TO_CHECK));
+      for i := 0 to Min(LineCount, MAX_LINES_TO_CHECK)-1 do
+        FLastLineBuffer[i] := LineBuffer[(LineCount - i - 1) mod MAX_LINES_TO_CHECK];
+
+    finally
+      // 임시 파일 정리
+      if (TempFileName <> FileName) and FileExists(TempFileName) then
+        SysUtils.DeleteFile(TempFileName);
+    end;
+  except
+    on E: Exception do
+    begin
+      // 파일 읽기 오류 발생 시 기본값 사용 (변경된 것으로 간주)
+      Result := True;
+
+      // 임시 파일 정리
+      if (TempFileName <> FileName) and FileExists(TempFileName) then
+        SysUtils.DeleteFile(TempFileName);
+    end;
+  end;
+end;
+
+// 로그 파일 다시 로드 메서드 수정
+procedure TPrintfLogForm.ReloadLogFile;
+var
+  FirstVisibleNode: PVirtualNode;
+  VisibleIndex: Integer;
+  HasChanges: Boolean;
+  FileSize: Int64;
+begin
+  if not FIsFileViewMode or (FLastLoadedFileName = '') then
+    Exit;
+
+  // 첫 번째 새로고침 건너뛰기
+  if FSkipNextRefresh then
+  begin
+    FSkipNextRefresh := False;
+    StatusBar.Panels[0].Text := Format('새로고침 초기화 중... (%s)',
+                               [FormatDateTime('hh:nn:ss', Now)]);
+
+    // 파일 정보만 갱신
+    if FileExists(FLastLoadedFileName) then
+    begin
+      // 파일 크기가 크면 자동 새로고침 간격 조정
+      FileSize := GetFileSize(FLastLoadedFileName);
+      if FileSize > 3 * 1024 * 1024 then // 3MB 이상
+      begin
+        if FAutoRefreshInterval < 5000 then // 5초 미만이면
+        begin
+          FAutoRefreshInterval := 10000; // 10초로 설정
+          FAutoRefreshTimer.Interval := FAutoRefreshInterval;
+          StatusBar.Panels[0].Text := Format('대용량 파일 감지: 새로고침 간격을 %d초로 조정',
+                                         [FAutoRefreshInterval div 1000]);
+        end;
+      end;
+    end;
+
+    Exit;
+  end;
+
+  // 파일 변경 확인
+  HasChanges := HasFileContentChanged(FLastLoadedFileName);
+
+  if not HasChanges then
+  begin
+    StatusBar.Panels[0].Text := Format('파일에 변경 없음 (마지막 확인: %s)',
+                               [FormatDateTime('hh:nn:ss', Now)]);
+    Exit;
+  end;
+
+  // 현재 스크롤 위치 저장
+  if FPreserveScrollPos then
+  begin
+    FirstVisibleNode := FLogTree.GetFirstVisible;
+    if Assigned(FirstVisibleNode) then
+      FLastVisibleNode := FirstVisibleNode;
+  end;
+
+  // 변경사항이 있을 때만 실제 리로드 수행
+  if HasChanges then
+  begin
+    // 원본 로드 함수 호출
+    LoadLogsFromFile(FLastLoadedFileName);
+
+    // 스크롤 위치 복원
+    if FPreserveScrollPos and Assigned(FLastVisibleNode) then
+    begin
+      // 대략적인 위치 계산 (예: 1/3 지점)
+      if FLogTree.TotalCount > 0 then
+      begin
+        VisibleIndex := FLogTree.RootNodeCount div 3;
+        FirstVisibleNode := FLogTree.GetFirst;
+
+        while Assigned(FirstVisibleNode) and (VisibleIndex > 0) do
+        begin
+          FirstVisibleNode := FLogTree.GetNext(FirstVisibleNode);
+          Dec(VisibleIndex);
+        end;
+
+        if Assigned(FirstVisibleNode) then
+          FLogTree.ScrollIntoView(FirstVisibleNode, False);
+      end;
+    end
+    else
+    begin
+      // 마지막 노드로 스크롤
+      FirstVisibleNode := FLogTree.GetLast;
+      if Assigned(FirstVisibleNode) then
+        FLogTree.ScrollIntoView(FirstVisibleNode, True);
+    end;
+
+    StatusBar.Panels[0].Text := Format('로그 파일 새로고침 완료: %s',
+                               [FormatDateTime('hh:nn:ss', Now)]);
+  end;
+
+  // 첫 번째 새로고침 완료 플래그 설정
+  FFirstRefreshDone := True;
+end;
+
+// 파일 크기 가져오기 함수
+function TPrintfLogForm.GetFileSize(const FileName: string): Int64;
+var
+  FileHandle: THandle;
+begin
+  Result := 0;
+
+  if not FileExists(FileName) then
+    Exit;
+
+  FileHandle := FileOpen(FileName, fmOpenRead or fmShareDenyNone);
+  if FileHandle <> THandle(-1) then
+  begin
+    try
+      Result := FileSeek(FileHandle, 0, soFromEnd);
+    finally
+      FileClose(FileHandle);
+    end;
+  end;
+end;
 
 // 날짜/시간 형식 검증 함수
 function TPrintfLogForm.IsValidDateTimeFormat(const DateTimeStr: string): Boolean;
@@ -3184,6 +4201,22 @@ begin
   Caption := '로그 파일 보기: ' + ExtractFileName(FileName);
   FIsFileViewMode := True;
 
+  // 파일 뷰어 모드에서 시간 칼럼 너비 조정 (날짜 포함 형식)
+  FLogTree.BeginUpdate;
+  try
+    // 시간 칼럼 너비 더 넓게 확장 (yyyy-mm-dd hh:nn:ss.zzz 형식 표시용)
+    FLogTree.Header.Columns[0].Width := 180;  // 더 넓게 (날짜 포함)
+    FLogTree.Header.Columns[0].MinWidth := 174;
+    FLogTree.InvalidateColumn(0);
+
+    // 소스 칼럼은 그대로 유지 (65px)
+
+    // 레이아웃 갱신
+    FLogTree.Invalidate;
+  finally
+    FLogTree.EndUpdate;
+  end;
+
   // 트레이 아이콘 불필요
   if Assigned(FTrayIcon) then
   begin
@@ -3234,6 +4267,27 @@ begin
 
   // 원본 노드 저장
   StoreOriginalNodes;
+
+  // 자동 새로고침 설정 초기화
+  FAutoRefreshEnabled := False;
+  FAutoRefreshInterval := 1000; // 기본 1초
+  FLastLoadedFileName := FileName;
+  FPreserveScrollPos := True;
+  // 파일 관련 변수 초기화
+  FLastFileSize := 0;
+  FLastFileModified := 0;
+  SetLength(FLastLineBuffer, 0); // 빈 배열로 초기화
+  FFirstRefreshDone := False;
+  FSkipNextRefresh := True; // 첫 번째 새로고침 건너뛰기 활성화
+
+  // 타이머 생성
+  FAutoRefreshTimer := TTimer.Create(Self);
+  FAutoRefreshTimer.Enabled := False;
+  FAutoRefreshTimer.Interval := FAutoRefreshInterval;
+  FAutoRefreshTimer.OnTimer := @OnAutoRefreshTimer;
+
+  // 메뉴에 자동 새로고침 옵션 추가
+  AddAutoRefreshMenuItem;
 end;
 
 { TPrintfHandler }
@@ -3371,6 +4425,9 @@ begin
     if FVisible then
       FLogForm.Show;
   end;
+
+  // 현재 로그 보기 메뉴 항목 추가
+  AddViewCurrentLogMenuItem;
 end;
 
 procedure TPrintfHandler.Shutdown;
@@ -3454,6 +4511,143 @@ begin
     FLogForm.ApplyColumnVisibility;
   end;
 end;
+
+
+// 현재 로깅 중인 파일 열기 기능
+procedure TPrintfHandler.ViewCurrentLogFile;
+var
+  LogFileName: string;
+  TempFileName: string;
+  ViewerForm: TPrintfLogForm;
+begin
+  if not Assigned(FLogForm) then
+    Exit;
+
+  // 현재 로그 파일이 없는 경우 메모리에 있는 내용으로 임시 파일 생성 후 보기
+  if (not FAutoSave) or (FRotateLogFolder = '') then
+  begin
+    TempFileName := GetTempDir + 'current_log_' + FormatDateTime('yyyymmddhhnnsszzz', Now) + '.log';
+
+    // 현재 내용을 임시 파일에 저장
+    SaveToFile(TempFileName);
+
+    // 파일 뷰어 폼 생성
+    ViewerForm := TPrintfLogForm.CreateForFileViewing(Application, TempFileName);
+    ViewerForm.Caption := '현재 로그 보기 (임시 파일)';
+    ViewerForm.Show;
+
+    Exit;
+  end;
+
+  // 현재 로그 파일 경로 확인
+  LogFileName := '';
+
+  // 1. 현재 날짜 기반 파일명 구성
+  LogFileName := IncludeTrailingPathDelimiter(FRotateLogFolder) +
+               FormatDateTime('yyyymmdd', Now) + '.log';
+
+  // 파일이 없으면 다른 이름 패턴 찾기
+  if not FileExists(LogFileName) then
+  begin
+    LogFileName := IncludeTrailingPathDelimiter(FRotateLogFolder) +
+                 FormatDateTime('yyyymmdd-hhnnss', Now) + '.log';
+
+    if not FileExists(LogFileName) then
+    begin
+      // 디렉토리에서 가장 최근 로그 파일 찾기
+      LogFileName := FindMostRecentLogFile(FRotateLogFolder);
+
+      if LogFileName = '' then
+      begin
+        // 로그 파일을 찾을 수 없음 - 임시 파일 생성
+        TempFileName := GetTempDir + 'current_log_' + FormatDateTime('yyyymmddhhnnsszzz', Now) + '.log';
+        SaveToFile(TempFileName);
+        LogFileName := TempFileName;
+      end;
+    end;
+  end;
+
+  // 파일 뷰어 폼 열기
+  ViewerForm := TPrintfLogForm.CreateForFileViewing(Application, LogFileName);
+  ViewerForm.Caption := '현재 로그 보기: ' + ExtractFileName(LogFileName);
+
+  // 자동 새로고침 설정 (필요시 활성화)
+  // 타이머 기반 자동 새로고침은 TPrintfLogForm에 구현되어 있음
+
+  ViewerForm.Show;
+end;
+
+// 가장 최근의 로그 파일 찾기
+function TPrintfHandler.FindMostRecentLogFile(const LogFolder: string): string;
+var
+  SearchRec: TSearchRec;
+  MostRecentTime: TDateTime;
+  MostRecentFile: string;
+  FilePath: string;
+  FileTime: TDateTime;
+  FileAge: Integer;
+begin
+  Result := '';
+
+  if not DirectoryExists(LogFolder) then
+    Exit;
+
+  MostRecentTime := 0;
+  MostRecentFile := '';
+
+  // 디렉토리 내 모든 .log 파일 검색
+  if FindFirst(IncludeTrailingPathDelimiter(LogFolder) + '*.log', faAnyFile, SearchRec) = 0 then
+  begin
+    try
+      repeat
+        FilePath := IncludeTrailingPathDelimiter(LogFolder) + SearchRec.Name;
+        FileAge := SysUtils.FileAge(FilePath);
+        if FileAge <> -1 then
+        begin
+          FileTime := FileDateToDateTime(FileAge);
+
+          if FileTime > MostRecentTime then
+          begin
+            MostRecentTime := FileTime;
+            MostRecentFile := FilePath;
+          end;
+        end;
+      until FindNext(SearchRec) <> 0;
+    finally
+      SysUtils.FindClose(SearchRec);
+    end;
+  end;
+
+  Result := MostRecentFile;
+end;
+
+// TPrintfHandler 클래스 내 메인 메뉴에 항목 추가
+procedure TPrintfHandler.AddViewCurrentLogMenuItem;
+var
+  LogMenu: TMenuItem;
+  MenuItem: TMenuItem;
+begin
+  if not Assigned(FLogForm) or not Assigned(FLogForm.LogTree) or
+     not Assigned(FLogForm.LogTree.PopupMenu) then
+    Exit;
+
+  // 로그 보기 메뉴 항목 추가
+  MenuItem := TMenuItem.Create(FLogForm.LogTree.PopupMenu);
+  MenuItem.Caption := '현재 로그 파일 보기';
+  MenuItem.Tag := 7; // 현재 로그 보기 태그
+  MenuItem.OnClick := @ViewCurrentLogMenuClick;
+
+  // 적절한 위치에 메뉴 삽입
+  FLogForm.LogTree.PopupMenu.Items.Insert(
+    FLogForm.LogTree.PopupMenu.Items.Count - 1, MenuItem);  // 마지막 항목 앞에 삽입
+end;
+
+// 메뉴 클릭 이벤트 핸들러
+procedure TPrintfHandler.ViewCurrentLogMenuClick(Sender: TObject);
+begin
+  ViewCurrentLogFile;
+end;
+
 
 procedure TPrintfHandler.ConfigureColumnVisibility(ShowTime, ShowLevel, ShowSource, ShowMessage: Boolean);
 var
