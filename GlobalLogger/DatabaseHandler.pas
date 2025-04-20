@@ -1,4 +1,3 @@
-// DatabaseHandler.pas 파일 내용
 unit DatabaseHandler;
 
 {$mode objfpc}{$H+}
@@ -14,30 +13,55 @@ type
     Message: string;
     Level: TLogLevel;
     Tag: string;
+    Timestamp: TDateTime;  // 타임스탬프 저장 (테이블 선택을 위해)
   end;
   PDBLogQueueItem = ^TDBLogQueueItem;
+
+  // 월별 로그 테이블 정보
+  TLogTableInfo = record
+    TableName: string;     // 테이블 이름
+    YearMonth: string;     // YYYYMM 형식
+    CreationDate: TDateTime; // 생성 일자
+    LastUpdate: TDateTime;   // 마지막 업데이트
+    RecordCount: Integer;    // 대략적인 행 개수 (ROW_COUNT 대신 RecordCount 사용)
+  end;
+
+  TLogTableInfoArray = array of TLogTableInfo;
 
   { TDatabaseHandler - 데이터베이스 로그 핸들러 }
   TDatabaseHandler = class(TLogHandler)
   private
     FConnection: TZConnection;       // 데이터베이스 연결
     FLogQuery: TZQuery;              // 로그 쿼리
-    FTableName: string;              // 로그 테이블 이름
+    FTablePrefix: string;            // 로그 테이블 접두사 (기본값: LOGS)
+    FMetaTableName: string;          // 메타 테이블 이름 (기본값: LOG_META)
     FAutoCreateTable: Boolean;       // 테이블 자동 생성 여부
     FQueueMaxSize: Integer;          // 큐 최대 크기
     FQueueFlushInterval: Integer;    // 큐 자동 플러시 간격
     FLastQueueFlush: TDateTime;      // 마지막 큐 플러시 시간
     FRetentionMonths: Integer;       // 로그 데이터 보관 개월 수
     FLastCleanupDate: TDateTime;     // 마지막 정리 날짜
+    FCurrentMonthTable: string;      // 현재 월 테이블 이름
+    FLastTableCheck: TDateTime;      // 마지막으로 테이블 체크한 시간
 
     // 비동기 처리 관련 필드
     FLogQueue: TThreadList;          // 로그 메시지 큐
 
     function BuildSourceIdentifier(const ATag: string): string;
     function LogLevelToStr(ALevel: TLogLevel): string;
-    procedure CreateLogTable;        // 로그 테이블 생성
-    procedure FlushQueue;            // 큐에 있는 로그 처리
-    procedure CleanupOldLogs;        // 오래된 로그 정리
+
+    // 테이블 관리 메서드
+    function GetMonthlyTableName(const ADate: TDateTime): string;
+    function GetCurrentMonthTableName: string;
+    procedure CreateMonthlyTable(const ATableName, AYearMonth: string);
+    procedure CreateMetaTable;
+    procedure UpdateMetaTable(const ATableName, AYearMonth: string; ACreationDate: TDateTime);
+    procedure UpdateTableRowCount(const ATableName: string);
+
+    // 큐 및 로그 처리
+    procedure FlushQueue;
+    procedure CleanupOldLogs;
+    procedure EnsureCurrentMonthTable;
 
   protected
     procedure WriteLog(const Msg: string; Level: TLogLevel); override;
@@ -52,19 +76,51 @@ type
     // 데이터베이스 연결 설정
     procedure SetConnection(const AHost, ADatabase, AUser, APassword: string);
 
+    // 로그 조회 메서드
+    function GetLogs(const StartDate, EndDate: TDateTime;
+                     const LogLevel: string = '';
+                     const SearchText: string = ''): TZQuery;
+
+    // 날짜 범위에 해당하는 테이블 목록 가져오기
+    function GetTablesBetweenDates(StartDate, EndDate: TDateTime): TStringList;
+
     // 속성
-    property TableName: string read FTableName write FTableName;
+    property TablePrefix: string read FTablePrefix write FTablePrefix;
+    property MetaTableName: string read FMetaTableName write FMetaTableName;
     property AutoCreateTable: Boolean read FAutoCreateTable write FAutoCreateTable;
     property QueueMaxSize: Integer read FQueueMaxSize write FQueueMaxSize;
     property QueueFlushInterval: Integer read FQueueFlushInterval write FQueueFlushInterval;
     property RetentionMonths: Integer read FRetentionMonths write FRetentionMonths;
   end;
 
+// GlobalLogger에서 DatabaseHandler 인스턴스를 찾는 함수
+function GetDatabaseHandler: TDatabaseHandler;
+
 implementation
 
 uses
   GlobalLogger;
 
+// GlobalLogger에서 DatabaseHandler 인스턴스를 찾는 전역 함수 구현
+function GetDatabaseHandler: TDatabaseHandler;
+var
+  i: Integer;
+begin
+  Result := nil;
+
+  if not Assigned(GlobalLogger.Logger) then
+    Exit;
+
+  // GlobalLogger의 LogHandlers에서 TDatabaseHandler 찾기
+  for i := 0 to GlobalLogger.Logger.LogHandlerCount - 1 do
+  begin
+    if GlobalLogger.Logger.LogHandlers[i] is TDatabaseHandler then
+    begin
+      Result := TDatabaseHandler(GlobalLogger.Logger.LogHandlers[i]);
+      Break;
+    end;
+  end;
+end;
 
 { TDatabaseHandler }
 
@@ -74,10 +130,13 @@ begin
 
   try
     // 기본값 설정
-    FTableName := 'LOGS';
+    FTablePrefix := 'LOGS';
+    FMetaTableName := 'LOG_META';
     FAutoCreateTable := True;
-    FRetentionMonths := 3;          // 기본 3개월 보관
-    FLastCleanupDate := 0;          // 초기값 0으로 설정해 첫 로그 작성시 정리 실행
+    FRetentionMonths := 12;          // 기본 12개월 보관
+    FLastCleanupDate := 0;           // 초기값 0으로 설정해 첫 로그 작성시 정리 실행
+    FLastTableCheck := 0;            // 초기화
+    FCurrentMonthTable := '';        // 아직 결정되지 않음
 
     // 데이터베이스 객체 생성
     FConnection := TZConnection.Create(nil);
@@ -140,11 +199,17 @@ begin
           end;
         end;
 
-        // 테이블 자동 생성이 활성화되어 있으면 테이블 생성
+        // 테이블 자동 생성이 활성화되어 있으면 메타 테이블 생성
         if FAutoCreateTable then
-          CreateLogTable;
+        begin
+          CreateMetaTable;
 
-        // 테이블 생성 후에 오래된 로그 정리 실행
+          // 현재 월에 해당하는 테이블 이름 초기화 및 생성 확인
+          FCurrentMonthTable := GetCurrentMonthTableName;
+          EnsureCurrentMonthTable;
+        end;
+
+        // 오래된 로그 정리 실행
         CleanupOldLogs;
       end;
     end;
@@ -255,7 +320,13 @@ begin
 
     // 테이블 생성 시도
     if FConnection.Connected and FAutoCreateTable then
-      CreateLogTable;
+    begin
+      CreateMetaTable;
+
+      // 현재 월 테이블 이름 초기화 및 생성 확인
+      FCurrentMonthTable := GetCurrentMonthTableName;
+      EnsureCurrentMonthTable;
+    end;
 
   except
     on E: Exception do
@@ -263,7 +334,82 @@ begin
   end;
 end;
 
-procedure TDatabaseHandler.CreateLogTable;
+// 월별 테이블 이름 생성 (YYYYMM 형식)
+function TDatabaseHandler.GetMonthlyTableName(const ADate: TDateTime): string;
+begin
+  Result := Format('%s_%s', [FTablePrefix, FormatDateTime('YYYYMM', ADate)]);
+end;
+
+// 현재 월에 해당하는 테이블 이름 가져오기
+function TDatabaseHandler.GetCurrentMonthTableName: string;
+begin
+  Result := GetMonthlyTableName(Date);
+end;
+
+// 메타 테이블 생성
+procedure TDatabaseHandler.CreateMetaTable;
+begin
+  try
+    if not FConnection.Connected then
+    begin
+      try
+        FConnection.Connect;
+      except
+        on E: Exception do
+        begin
+          DebugToFile('DatabaseHandler 메타 테이블 생성 중 연결 오류: ' + E.Message);
+          Exit;
+        end;
+      end;
+    end;
+
+    try
+      // 메타 테이블 존재 여부 확인
+      FLogQuery.Close;
+      FLogQuery.SQL.Text :=
+        'SELECT COUNT(*) FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = ''' + UpperCase(FMetaTableName) + '''';
+      FLogQuery.Open;
+
+      if FLogQuery.Fields[0].AsInteger = 0 then
+      begin
+        // 테이블이 없으면 생성 - ROW_COUNT 대신 RECORD_COUNT 사용
+        FLogQuery.Close;
+        FLogQuery.SQL.Text :=
+          'CREATE TABLE ' + FMetaTableName + ' (' +
+          '  TABLE_NAME VARCHAR(63) NOT NULL PRIMARY KEY,' +
+          '  YEAR_MONTH VARCHAR(6) NOT NULL,' +
+          '  CREATION_DATE DATE NOT NULL,' +
+          '  LAST_UPDATE DATE NOT NULL,' +
+          '  RECORD_COUNT INTEGER DEFAULT 0' +
+          ')';
+
+        DebugToFile('메타 테이블 생성 시도: ' + FLogQuery.SQL.Text);
+        FLogQuery.ExecSQL;
+        DebugToFile('메타 테이블 생성 성공');
+
+        // 인덱스 생성
+        FLogQuery.SQL.Text :=
+          'CREATE INDEX IDX_' + FMetaTableName + '_YM ON ' + FMetaTableName + ' (YEAR_MONTH)';
+        FLogQuery.ExecSQL;
+        DebugToFile('메타 테이블 인덱스 생성 성공');
+      end
+      else
+      begin
+        FLogQuery.Close;
+        DebugToFile('메타 테이블이 이미 존재함: ' + FMetaTableName);
+      end;
+    except
+      on E: Exception do
+        DebugToFile('DatabaseHandler 메타 테이블 생성 SQL 오류: ' + E.Message);
+    end;
+  except
+    on E: Exception do
+      DebugToFile('DatabaseHandler 메타 테이블 생성 오류: ' + E.Message);
+  end;
+end;
+
+// 월별 로그 테이블 생성
+procedure TDatabaseHandler.CreateMonthlyTable(const ATableName, AYearMonth: string);
 begin
   try
     if not FConnection.Connected then
@@ -280,50 +426,71 @@ begin
     end;
 
     try
-      // 테이블 존재 여부 확인을 위한 쿼리 (Firebird 구문)
+      // 테이블 존재 여부 확인
       FLogQuery.Close;
       FLogQuery.SQL.Text :=
-        'SELECT COUNT(*) FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = ''' + UpperCase(FTableName) + '''';
+        'SELECT COUNT(*) FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = ''' + UpperCase(ATableName) + '''';
       FLogQuery.Open;
 
       if FLogQuery.Fields[0].AsInteger = 0 then
       begin
-        // 테이블이 없으면 생성 - TIME WITHOUT TIME ZONE 사용
+        // 테이블이 없으면 생성 - Firebird 5.0의 TIME WITHOUT TIME ZONE 사용
         FLogQuery.Close;
         FLogQuery.SQL.Text :=
-          'CREATE TABLE ' + FTableName + ' (' +
+          'CREATE TABLE ' + ATableName + ' (' +
           '  ID INTEGER NOT NULL PRIMARY KEY,' +
           '  LDATE DATE NOT NULL,' +
           '  LTIME TIME WITHOUT TIME ZONE NOT NULL,' + // 밀리초까지 저장 가능한 시간 타입
-          '  LLEVEL VARCHAR(20) NOT NULL,' + // 문자열로 저장
+          '  LLEVEL VARCHAR(20) NOT NULL,' +
           '  LSOURCE VARCHAR(100),' +
           '  LMESSAGE VARCHAR(4000)' +
           ')';
 
         DebugToFile('테이블 생성 시도: ' + FLogQuery.SQL.Text);
         FLogQuery.ExecSQL;
-        DebugToFile('테이블 생성 성공');
+        DebugToFile('테이블 생성 성공: ' + ATableName);
 
         // 시퀀스 생성
-        FLogQuery.SQL.Text := 'CREATE SEQUENCE SEQ_' + FTableName;
+        FLogQuery.SQL.Text := 'CREATE SEQUENCE SEQ_' + ATableName;
         FLogQuery.ExecSQL;
-        DebugToFile('시퀀스 생성 성공');
+        DebugToFile('시퀀스 생성 성공: SEQ_' + ATableName);
 
         // 트리거 생성
         FLogQuery.SQL.Text :=
-          'CREATE TRIGGER ' + FTableName + '_BI FOR ' + FTableName + ' ' +
+          'CREATE TRIGGER ' + ATableName + '_BI FOR ' + ATableName + ' ' +
           'ACTIVE BEFORE INSERT POSITION 0 AS ' +
           'BEGIN ' +
           '  IF (NEW.ID IS NULL) THEN ' +
-          '    NEW.ID = NEXT VALUE FOR SEQ_' + FTableName + '; ' +
+          '    NEW.ID = NEXT VALUE FOR SEQ_' + ATableName + '; ' +
           'END';
         FLogQuery.ExecSQL;
-        DebugToFile('트리거 생성 성공');
+        DebugToFile('트리거 생성 성공: ' + ATableName + '_BI');
+
+        // 인덱스 생성 - 날짜, 레벨, 소스에 대한 인덱스
+        FLogQuery.SQL.Text :=
+          'CREATE INDEX IDX_' + ATableName + '_DATE ON ' + ATableName + ' (LDATE)';
+        FLogQuery.ExecSQL;
+
+        FLogQuery.SQL.Text :=
+          'CREATE INDEX IDX_' + ATableName + '_LEVEL ON ' + ATableName + ' (LLEVEL)';
+        FLogQuery.ExecSQL;
+
+        FLogQuery.SQL.Text :=
+          'CREATE INDEX IDX_' + ATableName + '_SOURCE ON ' + ATableName + ' (LSOURCE)';
+        FLogQuery.ExecSQL;
+
+        DebugToFile('인덱스 생성 성공: ' + ATableName);
+
+        // 메타 테이블 업데이트
+        UpdateMetaTable(ATableName, AYearMonth, Now);
       end
       else
       begin
         FLogQuery.Close;
-        DebugToFile('테이블이 이미 존재함: ' + FTableName);
+        DebugToFile('테이블이 이미 존재함: ' + ATableName);
+
+        // 메타 테이블에 없으면 추가
+        UpdateMetaTable(ATableName, AYearMonth, Now);
       end;
     except
       on E: Exception do
@@ -335,66 +502,276 @@ begin
   end;
 end;
 
-procedure TDatabaseHandler.CleanupOldLogs;
-var
-  CutoffDate: TDateTime;
-  DaysSinceLastCleanup: Integer;
-  TableExists: Boolean;
+// 메타 테이블 업데이트
+procedure TDatabaseHandler.UpdateMetaTable(const ATableName, AYearMonth: string; ACreationDate: TDateTime);
 begin
   try
-    // 하루에 한 번만 정리 실행
-    DaysSinceLastCleanup := DaysBetween(Now, FLastCleanupDate);
-    if DaysSinceLastCleanup < 1 then
-      Exit;
-
-    if not FConnection.Connected then
-      FConnection.Connect;
-
-    // 보관 기간이 0 이하인 경우 정리하지 않음
-    if FRetentionMonths <= 0 then
-      Exit;
-
-    // 테이블이 존재하는지 먼저 확인
-    TableExists := False;
-    try
-      FLogQuery.Close;
-      FLogQuery.SQL.Text :=
-        'SELECT COUNT(*) FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = ''' + UpperCase(FTableName) + '''';
-      FLogQuery.Open;
-      TableExists := (FLogQuery.Fields[0].AsInteger > 0);
-      FLogQuery.Close;
-    except
-      DebugToFile('테이블 존재 여부 확인 실패');
-      Exit;
-    end;
-
-    // 테이블이 존재하지 않으면 정리하지 않음
-    if not TableExists then
-    begin
-      DebugToFile('로그 테이블이 존재하지 않아 정리를 건너뜁니다: ' + FTableName);
-      // 마지막 정리 날짜 업데이트 (다음 오류 방지)
-      FLastCleanupDate := Now;
-      Exit;
-    end;
-
-    // 보관 기간에 따른 기준 날짜 계산 (오늘로부터 X개월 전)
-    CutoffDate := IncMonth(Date, -FRetentionMonths);
-
-    // 기준 날짜보다 오래된 로그 삭제
+    // 메타 테이블에 해당 테이블 정보가 있는지 확인
     FLogQuery.Close;
     FLogQuery.SQL.Text :=
-      'DELETE FROM ' + FTableName + ' WHERE LDATE < :CutoffDate';
-    FLogQuery.ParamByName('CutoffDate').AsDate := CutoffDate;
-    FLogQuery.ExecSQL;
+      'SELECT COUNT(*) FROM ' + FMetaTableName + ' WHERE TABLE_NAME = :TableName';
+    FLogQuery.ParamByName('TableName').AsString := ATableName;
+    FLogQuery.Open;
 
-    // 마지막 정리 날짜 업데이트
-    FLastCleanupDate := Now;
+    if FLogQuery.Fields[0].AsInteger = 0 then
+    begin
+      // 없으면 새로 추가
+      FLogQuery.Close;
+      FLogQuery.SQL.Text :=
+        'INSERT INTO ' + FMetaTableName + ' (TABLE_NAME, YEAR_MONTH, CREATION_DATE, LAST_UPDATE, RECORD_COUNT) ' +
+        'VALUES (:TableName, :YearMonth, :CreationDate, :LastUpdate, 0)';
+      FLogQuery.ParamByName('TableName').AsString := ATableName;
+      FLogQuery.ParamByName('YearMonth').AsString := AYearMonth;
+      FLogQuery.ParamByName('CreationDate').AsDate := ACreationDate;
+      FLogQuery.ParamByName('LastUpdate').AsDate := ACreationDate;
+      FLogQuery.ExecSQL;
 
-    DebugToFile(Format('DatabaseHandler 로그 정리 완료: %d개월 이전 로그 삭제 (%s 이전)',
-                      [FRetentionMonths, FormatDateTime('yyyy-mm-dd', CutoffDate)]));
+      DebugToFile('메타 테이블에 새 테이블 정보 추가: ' + ATableName);
+    end
+    else
+    begin
+      // 있으면 마지막 업데이트 시간만 갱신
+      FLogQuery.Close;
+      FLogQuery.SQL.Text :=
+        'UPDATE ' + FMetaTableName + ' SET LAST_UPDATE = :LastUpdate ' +
+        'WHERE TABLE_NAME = :TableName';
+      FLogQuery.ParamByName('LastUpdate').AsDate := Now;
+      FLogQuery.ParamByName('TableName').AsString := ATableName;
+      FLogQuery.ExecSQL;
+
+      DebugToFile('메타 테이블 정보 업데이트: ' + ATableName);
+    end;
   except
     on E: Exception do
-      DebugToFile('DatabaseHandler 로그 정리 오류: ' + E.Message);
+      DebugToFile('메타 테이블 업데이트 오류: ' + E.Message);
+  end;
+end;
+
+// 테이블의 행 수 업데이트
+procedure TDatabaseHandler.UpdateTableRowCount(const ATableName: string);
+var
+  RowCount: Integer;
+begin
+  try
+    // 테이블 행 수 조회
+    FLogQuery.Close;
+    FLogQuery.SQL.Text := 'SELECT COUNT(*) FROM ' + ATableName;
+    FLogQuery.Open;
+    RowCount := FLogQuery.Fields[0].AsInteger;
+    FLogQuery.Close;
+
+    // 메타 테이블 업데이트
+    FLogQuery.SQL.Text :=
+      'UPDATE ' + FMetaTableName + ' SET RECORD_COUNT = :RowCount, LAST_UPDATE = :LastUpdate ' +
+      'WHERE TABLE_NAME = :TableName';
+    FLogQuery.ParamByName('RowCount').AsInteger := RowCount;
+    FLogQuery.ParamByName('LastUpdate').AsDate := Now;
+    FLogQuery.ParamByName('TableName').AsString := ATableName;
+    FLogQuery.ExecSQL;
+  except
+    on E: Exception do
+      DebugToFile('테이블 행 수 업데이트 오류: ' + E.Message);
+  end;
+end;
+
+// 현재 월 테이블이 있는지 확인하고 없으면 생성
+procedure TDatabaseHandler.EnsureCurrentMonthTable;
+var
+  CurrentMonth: string;
+  CurrentTable: string;
+begin
+  // 마지막 체크 이후 하루가 지났으면 다시 체크
+  if MinutesBetween(Now, FLastTableCheck) < 60 then
+    Exit;
+
+  try
+    // 현재 월에 해당하는 테이블 이름과 월 문자열 가져오기
+    CurrentTable := GetCurrentMonthTableName;
+    CurrentMonth := FormatDateTime('YYYYMM', Date);
+
+    // 현재 설정된 테이블이 이번 달 테이블이 아니면 새로 설정
+    if FCurrentMonthTable <> CurrentTable then
+    begin
+      FCurrentMonthTable := CurrentTable;
+      DebugToFile('현재 월 테이블 변경: ' + FCurrentMonthTable);
+    end;
+
+    // 테이블이 없으면 생성
+    CreateMonthlyTable(FCurrentMonthTable, CurrentMonth);
+
+    // 마지막 체크 시간 업데이트
+    FLastTableCheck := Now;
+  except
+    on E: Exception do
+      DebugToFile('현재 월 테이블 확인 오류: ' + E.Message);
+  end;
+end;
+
+// 날짜 범위에 해당하는 테이블 목록 가져오기
+function TDatabaseHandler.GetTablesBetweenDates(StartDate, EndDate: TDateTime): TStringList;
+var
+  StartYearMonth, EndYearMonth: string;
+  CurrentDate: TDateTime;
+  TableName: string;
+  YearMonth: string;
+begin
+  Result := TStringList.Create;
+
+  try
+    // 날짜 범위를 YYYYMM 형식의 문자열로 변환
+    StartYearMonth := FormatDateTime('YYYYMM', StartOfTheMonth(StartDate));
+    EndYearMonth := FormatDateTime('YYYYMM', StartOfTheMonth(EndDate));
+
+    // 메타 테이블이 있는지 확인
+    FLogQuery.Close;
+    FLogQuery.SQL.Text :=
+      'SELECT COUNT(*) FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = ''' + UpperCase(FMetaTableName) + '''';
+    FLogQuery.Open;
+
+    if FLogQuery.Fields[0].AsInteger > 0 then
+    begin
+      // 메타 테이블에서 조회
+      FLogQuery.Close;
+      FLogQuery.SQL.Text :=
+        'SELECT TABLE_NAME FROM ' + FMetaTableName + ' ' +
+        'WHERE YEAR_MONTH >= :StartYM AND YEAR_MONTH <= :EndYM ' +
+        'ORDER BY YEAR_MONTH';
+      FLogQuery.ParamByName('StartYM').AsString := StartYearMonth;
+      FLogQuery.ParamByName('EndYM').AsString := EndYearMonth;
+      FLogQuery.Open;
+
+      // 결과를 리스트에 추가
+      while not FLogQuery.EOF do
+      begin
+        Result.Add(FLogQuery.FieldByName('TABLE_NAME').AsString);
+        FLogQuery.Next;
+      end;
+    end
+    else
+    begin
+      // 메타 테이블이 없으면 테이블 이름 패턴으로 조회
+      FLogQuery.Close;
+      FLogQuery.SQL.Text :=
+        'SELECT RDB$RELATION_NAME FROM RDB$RELATIONS ' +
+        'WHERE RDB$RELATION_NAME LIKE ''' + UpperCase(FTablePrefix) + '_%'' ' +
+        'AND RDB$SYSTEM_FLAG = 0 ' +
+        'ORDER BY RDB$RELATION_NAME';
+      FLogQuery.Open;
+
+      // 결과에서 날짜 범위에 해당하는 테이블만 필터링
+      while not FLogQuery.EOF do
+      begin
+        TableName := Trim(FLogQuery.FieldByName('RDB$RELATION_NAME').AsString);
+
+        // 테이블 이름에서 YYYYMM 부분 추출
+        if Length(TableName) >= Length(FTablePrefix) + 7 then
+        begin
+          YearMonth := Copy(TableName, Length(FTablePrefix) + 2, 6);
+
+          // 날짜 범위에 포함되는지 확인
+          if (YearMonth >= StartYearMonth) and (YearMonth <= EndYearMonth) then
+            Result.Add(TableName);
+        end;
+
+        FLogQuery.Next;
+      end;
+    end;
+
+    // 결과가 없으면 현재 테이블만 포함
+    if Result.Count = 0 then
+    begin
+      // 현재 달 테이블이라도 확인
+      EnsureCurrentMonthTable;
+      Result.Add(FCurrentMonthTable);
+    end;
+  except
+    on E: Exception do
+    begin
+      DebugToFile('날짜 범위 테이블 조회 오류: ' + E.Message);
+      Result.Clear; // 오류 시 빈 리스트 반환
+    end;
+  end;
+end;
+
+// 로그 조회 메서드
+function TDatabaseHandler.GetLogs(const StartDate, EndDate: TDateTime;
+                                  const LogLevel: string = '';
+                                  const SearchText: string = ''): TZQuery;
+var
+  SQL: TStringList;
+  Tables: TStringList;
+  i: Integer;
+  LevelFilter, SearchFilter: string;
+  Query: TZQuery;
+begin
+  Query := TZQuery.Create(nil);
+  Query.Connection := FConnection;
+
+  SQL := TStringList.Create;
+  Tables := nil;
+
+  try
+    // 날짜 범위에 해당하는 테이블 목록 가져오기
+    Tables := GetTablesBetweenDates(StartDate, EndDate);
+
+    // 테이블이 없으면 빈 결과셋 반환
+    if Tables.Count = 0 then
+    begin
+      SQL.Add('SELECT 0 AS ID, CAST(''1900-01-01'' AS DATE) AS LDATE,');
+      SQL.Add('CAST(''00:00:00'' AS TIME) AS LTIME,');
+      SQL.Add('''NONE'' AS LLEVEL, '''' AS LSOURCE, ''데이터 없음'' AS LMESSAGE');
+      SQL.Add('FROM RDB$DATABASE WHERE 1=0');
+
+      Query.SQL.Text := SQL.Text;
+      Query.Open;
+      Result := Query;
+      Exit;
+    end;
+
+    // 필터 준비
+    if LogLevel <> '' then
+      LevelFilter := Format('LLEVEL = ''%s''', [LogLevel])
+    else
+      LevelFilter := '';
+
+    if SearchText <> '' then
+    begin
+      SearchFilter := Format('(LSOURCE LIKE ''%%%s%%'' OR LMESSAGE LIKE ''%%%s%%'')',
+                           [SearchText, SearchText]);
+    end
+    else
+      SearchFilter := '';
+
+    // 여러 테이블을 UNION ALL로 결합
+    for i := 0 to Tables.Count - 1 do
+    begin
+      if i > 0 then
+        SQL.Add('UNION ALL');
+
+      SQL.Add(Format('SELECT ID, LDATE, LTIME, LLEVEL, LSOURCE, LMESSAGE FROM %s', [Tables[i]]));
+      SQL.Add('WHERE LDATE >= :StartDate AND LDATE <= :EndDate');
+
+      if LevelFilter <> '' then
+        SQL.Add('AND ' + LevelFilter);
+
+      if SearchFilter <> '' then
+        SQL.Add('AND ' + SearchFilter);
+    end;
+
+    // 최종 정렬
+    SQL.Add('ORDER BY LDATE DESC, LTIME DESC');
+
+    // 쿼리 실행
+    Query.SQL.Text := SQL.Text;
+    Query.ParamByName('StartDate').AsDate := StartDate;
+    Query.ParamByName('EndDate').AsDate := EndDate;
+    Query.Open;
+
+    Result := Query;
+  finally
+    SQL.Free;
+    if Assigned(Tables) then
+      Tables.Free;
   end;
 end;
 
@@ -435,6 +812,9 @@ var
   CurrentTime: TDateTime;
   Start, End_: Integer;
 begin
+  // 현재 월 테이블 확인 및 필요시 생성
+  EnsureCurrentMonthTable;
+
   // 하루에 한 번 오래된 로그 정리
   if DaysBetween(Now, FLastCleanupDate) >= 1 then
     CleanupOldLogs;
@@ -482,9 +862,10 @@ begin
   begin
     // 비동기 모드: 큐에 메시지 추가
     New(LogItem);
-    LogItem^.Message := LogMessage; // 실제 메시지 부분만 저장
+    LogItem^.Message := LogMessage;  // 실제 메시지 부분만 저장
     LogItem^.Level := Level;
-    LogItem^.Tag := SourceTag;  // 추출된 소스 태그 사용
+    LogItem^.Tag := SourceTag;       // 추출된 소스 태그 사용
+    LogItem^.Timestamp := CurrentTime; // 타임스탬프 저장 (테이블 선택용)
 
     List := FLogQueue.LockList;
     try
@@ -492,14 +873,14 @@ begin
 
       // 큐 크기 확인 및 필요시 플러시
       if List.Count >= FQueueMaxSize then
-      begin
-        FLogQueue.UnlockList;
         FlushQueue;
-      end;
     finally
-      if List <> nil then
-        FLogQueue.UnlockList;
+      FLogQueue.UnlockList;
     end;
+
+    // 자동 플러시 확인 - 마지막 플러시 이후 지정된 시간이 지났으면 큐 플러시
+    if MilliSecondsBetween(Now, FLastQueueFlush) >= FQueueFlushInterval then
+      FlushQueue;
   end
   else
   begin
@@ -510,7 +891,7 @@ begin
 
       FLogQuery.Close;
       FLogQuery.SQL.Text :=
-        'INSERT INTO ' + FTableName + ' (LDATE, LTIME, LLEVEL, LSOURCE, LMESSAGE) ' +
+        'INSERT INTO ' + FCurrentMonthTable + ' (LDATE, LTIME, LLEVEL, LSOURCE, LMESSAGE) ' +
         'VALUES (:LDATE, :LTIME, :LLEVEL, :LSOURCE, :LMESSAGE)';
 
       FLogQuery.ParamByName('LDATE').AsDate := Date;
@@ -520,6 +901,13 @@ begin
       FLogQuery.ParamByName('LMESSAGE').AsString := LogMessage;
 
       FLogQuery.ExecSQL;
+
+      // 주기적으로 메타 테이블 업데이트 (한 시간에 한 번)
+      if HoursBetween(Now, FLastTableCheck) >= 1 then
+      begin
+        UpdateTableRowCount(FCurrentMonthTable);
+        FLastTableCheck := Now;
+      end;
     except
       on E: Exception do
         DebugToFile('DatabaseHandler 로그 작성 오류: ' + E.Message);
@@ -530,9 +918,13 @@ end;
 procedure TDatabaseHandler.FlushQueue;
 var
   List: TList;
-  i: Integer;
+  i, j: Integer;  // 별도의 루프 변수 사용
   LogItem: PDBLogQueueItem;
-  CurrentTime: TDateTime;
+  TableItems: TStringList;
+  CurrentDate: TDateTime;
+  MonthTable: string;
+  ItemsStr, ValuesStr: string;
+  BatchSize: Integer;
 begin
   List := FLogQueue.LockList;
   try
@@ -543,48 +935,96 @@ begin
       if not FConnection.Connected then
         FConnection.Connect;
 
-      // 트랜잭션 시작
-      if not FConnection.InTransaction then
-        FConnection.StartTransaction;
+      TableItems := TStringList.Create;
+      try
+        // 각 아이템을 해당 월 테이블로 분류
+        for i := 0 to List.Count - 1 do
+        begin
+          LogItem := PDBLogQueueItem(List[i]);
+          CurrentDate := LogItem^.Timestamp;
+          MonthTable := GetMonthlyTableName(CurrentDate);
 
-      // 현재 시간 (밀리초 포함)
-      CurrentTime := Now;
+          if TableItems.IndexOf(MonthTable) < 0 then
+          begin
+            CreateMonthlyTable(MonthTable, FormatDateTime('YYYYMM', CurrentDate));
+            TableItems.Add(MonthTable);
+          end;
+        end;
 
-      // 모든 큐 항목 처리
-      for i := 0 to List.Count - 1 do
-      begin
-        LogItem := PDBLogQueueItem(List[i]);
+        if not FConnection.InTransaction then
+          FConnection.StartTransaction;
 
-        FLogQuery.Close;
-        FLogQuery.SQL.Text :=
-          'INSERT INTO ' + FTableName + ' (LDATE, LTIME, LLEVEL, LSOURCE, LMESSAGE) ' +
-          'VALUES (:LDATE, :LTIME, :LLEVEL, :LSOURCE, :LMESSAGE)';
+        // 테이블별로 배치 삽입 수행
+        for j := 0 to TableItems.Count - 1 do  // 외부 루프는 j 사용
+        begin
+          MonthTable := TableItems[j];
+          BatchSize := 0;
+          ItemsStr := '';
+          ValuesStr := '';
 
-        FLogQuery.ParamByName('LDATE').AsDate := Date;
-        FLogQuery.ParamByName('LTIME').AsTime := CurrentTime; // 시간 타입으로 저장 (밀리초 포함)
-        FLogQuery.ParamByName('LLEVEL').AsString := LogLevelToStr(LogItem^.Level);
-        FLogQuery.ParamByName('LSOURCE').AsString := LogItem^.Tag;
-        FLogQuery.ParamByName('LMESSAGE').AsString := LogItem^.Message;
+          // 해당 테이블에 속한 아이템들 배치 처리
+          for i := 0 to List.Count - 1 do  // 내부 루프는 i 사용
+          begin
+            LogItem := PDBLogQueueItem(List[i]);
+            CurrentDate := LogItem^.Timestamp;
 
-        FLogQuery.ExecSQL;
+            if GetMonthlyTableName(CurrentDate) = MonthTable then
+            begin
+              if BatchSize > 0 then
+                ValuesStr := ValuesStr + ', ';
 
-        // 메모리 해제
-        Dispose(LogItem);
+              ValuesStr := ValuesStr + Format('(%s, %s, ''%s'', ''%s'', ''%s'')',
+                           [QuotedStr(FormatDateTime('yyyy-mm-dd', DateOf(CurrentDate))),
+                            QuotedStr(FormatDateTime('hh:nn:ss.zzz', TimeOf(CurrentDate))),
+                            LogLevelToStr(LogItem^.Level),
+                            StringReplace(LogItem^.Tag, '''', '''''', [rfReplaceAll]),
+                            StringReplace(LogItem^.Message, '''', '''''', [rfReplaceAll])]);
+
+              Inc(BatchSize);
+
+              if BatchSize >= 50 then
+              begin
+                FLogQuery.Close;
+                FLogQuery.SQL.Text := Format('INSERT INTO %s (LDATE, LTIME, LLEVEL, LSOURCE, LMESSAGE) VALUES %s',
+                                       [MonthTable, ValuesStr]);
+                FLogQuery.ExecSQL;
+
+                BatchSize := 0;
+                ValuesStr := '';
+              end;
+            end;
+          end;
+
+          if BatchSize > 0 then
+          begin
+            FLogQuery.Close;
+            FLogQuery.SQL.Text := Format('INSERT INTO %s (LDATE, LTIME, LLEVEL, LSOURCE, LMESSAGE) VALUES %s',
+                               [MonthTable, ValuesStr]);
+            FLogQuery.ExecSQL;
+          end;
+
+          UpdateMetaTable(MonthTable, Copy(MonthTable, Length(FTablePrefix) + 2, 6), Now);
+          UpdateTableRowCount(MonthTable);
+        end;
+
+        if FConnection.InTransaction then
+          FConnection.Commit;
+
+        for i := 0 to List.Count - 1 do
+        begin
+          LogItem := PDBLogQueueItem(List[i]);
+          Dispose(LogItem);
+        end;
+
+        List.Clear;
+      finally
+        TableItems.Free;
       end;
 
-      // 트랜잭션 커밋
-      if FConnection.InTransaction then
-        FConnection.Commit;
-
-      // 처리 완료된 항목 제거
-      List.Clear;
-
-      // 마지막 플러시 시간 갱신
       FLastQueueFlush := Now;
     except
       on E: Exception do
       begin
-        // 에러 발생 시 트랜잭션 롤백
         if FConnection.InTransaction then
           FConnection.Rollback;
 
@@ -596,107 +1036,140 @@ begin
   end;
 end;
 
+procedure TDatabaseHandler.CleanupOldLogs;
+var
+  CutoffDate: TDateTime;
+  YearMonth: Integer;
+  CurrentYearMonth: Integer;
+  i: Integer;
+  TableName: string;
+  YearMonthStr: string;
+begin
+  try
+    // 하루에 한 번만 정리 실행
+    if DaysBetween(Now, FLastCleanupDate) < 1 then
+      Exit;
+
+    if not FConnection.Connected then
+      FConnection.Connect;
+
+    // 보관 기간이 0 이하인 경우 정리하지 않음
+    if FRetentionMonths <= 0 then
+      Exit;
+
+    // 현재 날짜의 YYYYMM 값 계산
+    CurrentYearMonth := StrToInt(FormatDateTime('YYYYMM', Date));
+
+    // 보관 기간에 따른 기준 날짜 계산 (오늘로부터 X개월 전)
+    CutoffDate := IncMonth(Date, -FRetentionMonths);
+
+    // 메타 테이블이 있는지 확인
+    FLogQuery.Close;
+    FLogQuery.SQL.Text :=
+      'SELECT COUNT(*) FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = ''' + UpperCase(FMetaTableName) + '''';
+    FLogQuery.Open;
+
+    if FLogQuery.Fields[0].AsInteger > 0 then
+    begin
+      // 메타 테이블에서 오래된 테이블 목록 조회
+      FLogQuery.Close;
+      FLogQuery.SQL.Text :=
+        'SELECT TABLE_NAME, YEAR_MONTH FROM ' + FMetaTableName +
+        ' ORDER BY YEAR_MONTH';
+      FLogQuery.Open;
+
+      while not FLogQuery.EOF do
+      begin
+        YearMonth := StrToIntDef(FLogQuery.FieldByName('YEAR_MONTH').AsString, 0);
+        TableName := FLogQuery.FieldByName('TABLE_NAME').AsString;
+
+        // 보관 기간보다 오래된 테이블 삭제
+        if (YearMonth > 0) and (YearMonth < StrToInt(FormatDateTime('YYYYMM', CutoffDate))) then
+        begin
+          try
+            // 메타 테이블에서 삭제
+            FLogQuery.Close;
+            FLogQuery.SQL.Text := 'DELETE FROM ' + FMetaTableName + ' WHERE TABLE_NAME = :TableName';
+            FLogQuery.ParamByName('TableName').AsString := TableName;
+            FLogQuery.ExecSQL;
+
+            // 시퀀스 삭제
+            FLogQuery.Close;
+            FLogQuery.SQL.Text := 'DROP SEQUENCE SEQ_' + TableName;
+            FLogQuery.ExecSQL;
+
+            // 테이블 삭제
+            FLogQuery.Close;
+            FLogQuery.SQL.Text := 'DROP TABLE ' + TableName;
+            FLogQuery.ExecSQL;
+
+            DebugToFile(Format('오래된 로그 테이블 삭제: %s (%s)',
+                           [TableName, FormatDateTime('YYYYMM', CutoffDate)]));
+          except
+            on E: Exception do
+              DebugToFile('테이블 삭제 오류: ' + TableName + ' - ' + E.Message);
+          end;
+        end;
+
+        FLogQuery.Next;
+      end;
+    end
+    else
+    begin
+      // 메타 테이블이 없으면 테이블 이름 패턴으로 조회
+      FLogQuery.Close;
+      FLogQuery.SQL.Text :=
+        'SELECT RDB$RELATION_NAME FROM RDB$RELATIONS ' +
+        'WHERE RDB$RELATION_NAME LIKE ''' + UpperCase(FTablePrefix) + '_%'' ' +
+        'AND RDB$SYSTEM_FLAG = 0';
+      FLogQuery.Open;
+
+      while not FLogQuery.EOF do
+      begin
+        TableName := Trim(FLogQuery.FieldByName('RDB$RELATION_NAME').AsString);
+
+        // 테이블 이름에서 YYYYMM 부분 추출
+        if Length(TableName) >= Length(FTablePrefix) + 7 then
+        begin
+          YearMonthStr := Copy(TableName, Length(FTablePrefix) + 2, 6);
+          YearMonth := StrToIntDef(YearMonthStr, 0);
+
+          // 보관 기간보다 오래된 테이블 삭제
+          if (YearMonth > 0) and (YearMonth < StrToInt(FormatDateTime('YYYYMM', CutoffDate))) then
+          begin
+            try
+              // 시퀀스 삭제
+              FLogQuery.Close;
+              FLogQuery.SQL.Text := 'DROP SEQUENCE SEQ_' + TableName;
+              FLogQuery.ExecSQL;
+
+              // 테이블 삭제
+              FLogQuery.Close;
+              FLogQuery.SQL.Text := 'DROP TABLE ' + TableName;
+              FLogQuery.ExecSQL;
+
+              DebugToFile(Format('오래된 로그 테이블 삭제: %s (%s)',
+                             [TableName, YearMonthStr]));
+            except
+              on E: Exception do
+                DebugToFile('테이블 삭제 오류: ' + TableName + ' - ' + E.Message);
+            end;
+          end;
+        end;
+
+        FLogQuery.Next;
+      end;
+    end;
+
+    // 마지막 정리 날짜 업데이트
+    FLastCleanupDate := Now;
+
+    DebugToFile(Format('DatabaseHandler 로그 정리 완료: %d개월 이전 로그 삭제',
+                       [FRetentionMonths]));
+  except
+    on E: Exception do
+      DebugToFile('DatabaseHandler 로그 정리 오류: ' + E.Message);
+  end;
+end;
 
 end.
-{
-이 코드는 월별 로그 테이블을 자동으로 관리하는 시스템을 구현합니다. 다음과 같은 주요 기능을 포함하고 있습니다:
-주요 기능
-
-자동 테이블 생성
-
-월별로 새로운 로그 테이블을 자동 생성합니다 (예: LOG_202504)
-각 테이블에 필요한 인덱스를 함께 생성합니다
-
-
-메타데이터 관리
-
-LOG_META 테이블에서 모든 로그 테이블의 정보를 관리합니다
-테이블별 생성 날짜, 마지막 업데이트, 행 수 등을 기록합니다
-
-
-자동 유지보수
-
-설정된 보관 기간(기본 12개월)이 지난 로그 테이블을 자동 삭제합니다
-주기적으로 테이블 메트릭을 업데이트합니다
-
-
-효율적인 조회
-
-여러 테이블에 걸친 조회를 자동으로 처리합니다
-날짜, 로그 레벨, 소스 등으로 필터링할 수 있습니다
-
-다음 설정을 적용했습니다:
-
-데이터베이스 파일: App\log\Log.fdb
-Firebird 클라이언트: App\fbclient.dll
-자동 경로 생성 및 DB 초기화 포함
-
-이 구현은 로그 데이터가 시간이 지남에 따라 늘어나도 성능이 유지되도록 설계되었습니다.
-필요에 따라 RetentionMonths 속성을 조정하여 로그 보관 기간을 변경할 수 있습니다.
-
-이 소스 코드는 다음 요소들을 모두 포함하고 있습니다:
-
-유닛 선언 및 인터페이스 섹션
-TDatabaseLogHandler 클래스 정의 및 모든 메서드
-구현 섹션의 모든 메서드 구현
-DB 생성, 연결, 테이블 관리 등 모든 기능
-
-요청하신 사항(App\log\Log.fdb 경로와 App\fbclient.dll 라이브러리 위치 등)을 모두 반영했습니다.
-이 코드를 그대로 GlobalLogger 프로젝트에 포함시켜 사용하실 수 있습니다.
-
-// 데이터베이스 로그 핸들러 등록
-var
-  DBHandler: TDatabaseLogHandler;
-begin
-  DBHandler := TDatabaseLogHandler.Create;
-  DBHandler.RetentionMonths := 6; // 선택적: 기본값은 12개월
-  GlobalLogger.RegisterLogHandler(DBHandler);
-
-  // 이제 로그를 기록하면 자동으로 DB에 저장됩니다
-  GlobalLogger.LogInfo('애플리케이션 시작됨');
-end;
-
-
-
-GlobalLogger와 통합
-
-TLogHandler 클래스를 상속하여 GlobalLogger 시스템과 완벽하게 통합됩니다
-DoWriteLog 메서드를 오버라이드하여
-GlobalLogger에서 로그 메시지를 받아 데이터베이스에 저장합니다
-SourceIdentifier 시스템을 활용하여 로그 소스 정보를 저장합니다
-
-
-월별 로그 테이블 자동 관리
-
-매월 새로운 테이블을 자동으로 생성합니다 (예: LOG_202504)
-LOG_META 테이블에서 모든 로그 테이블의 정보를 관리합니다
-지정된 기간(기본 12개월)이 지난 오래된 테이블을 자동으로 삭제합니다
-
-
-효율적인 다중 테이블 조회
-
-GetLogs 메서드를 통해 여러 테이블에 걸친 로그를 쉽게 조회할 수 있습니다
-날짜, 로그 레벨, 태그로 필터링이 가능합니다
-
-
-Firebird DB 설정
-
-App\log\Log.fdb 경로에 데이터베이스 파일을 생성합니다
-App\fbclient.dll 경로의 클라이언트 라이브러리를 사용합니다
-
-
-
-이 코드는 다음과 같이 GlobalLogger 시스템에서 사용할 수 있습니다:
-// 초기화 예시
-var
-  DBHandler: TDatabaseLogHandler;
-begin
-  // 데이터베이스 로그 핸들러 생성 및 등록
-  DBHandler := TDatabaseLogHandler.Create;
-  DBHandler.RetentionMonths := 6; // 6개월 보관으로 설정
-  GlobalLogger.RegisterLogHandler(DBHandler);
-
-  // 이제 GlobalLogger를 통해 기록되는 모든 로그가 DB에도 저장됩니다
-  Logger.LogInfo('애플리케이션 시작');
-end;
-}

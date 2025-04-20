@@ -260,6 +260,7 @@ type
 // 간편한 전역 액세스 함수
 function Logger: TGlobalLogger;
 function GetPrintfHandler: TPrintfHandler;
+function GetDatabaseHandler: TDatabaseHandler;
 // 다른 유닛에서 접근할 수 있도록 interface 섹션에 함수 선언
 procedure DebugToFile(const Msg: string);
 
@@ -331,6 +332,33 @@ begin
     end;
   end;
 end;
+
+
+function GetDatabaseHandler: TDatabaseHandler;
+var
+  i: Integer;
+  Handler: TLogHandler;
+  HandlerList: TList;
+begin
+  Result := nil;
+
+  // Logger의 내부 핸들러 리스트에 접근
+  HandlerList := Logger.FHandlers; // 또는 Logger.GetHandlers 등 적절한 메서드 사용
+
+  if Assigned(HandlerList) then
+  begin
+    for i := 0 to HandlerList.Count - 1 do
+    begin
+      Handler := TLogHandler(HandlerList[i]);
+      if Handler is TDatabaseHandler then
+      begin
+        Result := TDatabaseHandler(Handler);
+        Break;
+      end;
+    end;
+  end;
+end;
+
 
 { TGlobalLogger }
 

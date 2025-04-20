@@ -9,7 +9,8 @@ uses
   DBGrids, DB, Buttons, ComCtrls, Menus, Clipbrd, CheckLst, Spin,
   LCLType,
   ZConnection, ZDataset, ZSqlUpdate, RxDBGrid, RxSortZeos, RxDBGridExportSpreadSheet,
-  DbCtrls, DateUtils, DateTimePicker;
+  DbCtrls, DateUtils, DateTimePicker,
+  DatabaseHandler;
 
 // 이 전역 변수를 추가합니다 - 리소스 없이 파생된 폼을 만들 수 있게 합니다
 {$IFDEF FPC}
@@ -98,6 +99,8 @@ type
     FSearchHistory: array of TSearchHistory;
     FLoading: Boolean;
 
+    FDBHandler: TDatabaseHandler;
+
     // UI 컴포넌트 초기화 및 설정
     procedure CreateComponents;
     procedure SetupGrid;
@@ -155,7 +158,10 @@ type
 
   public
     constructor Create(AOwner: TComponent); override;
+    constructor CreateWithDBHandler(AOwner: TComponent; ADBHandler: TDatabaseHandler);
     destructor Destroy; override;
+
+    property DBHandler: TDatabaseHandler read FDBHandler write FDBHandler;
   end;
 
 var
@@ -169,7 +175,7 @@ implementation
 //{$R *.lfm}
 
 uses
-  GlobalLogger, StrUtils, IniFiles;
+  GlobalLogger, LogHandlers, StrUtils, IniFiles;
 
 { TfrmLogViewer }
 
@@ -229,6 +235,13 @@ begin
 
   // 데이터 로드
   RefreshData;
+end;
+
+// 생성자 구현 추가
+constructor TfrmLogViewer.CreateWithDBHandler(AOwner: TComponent; ADBHandler: TDatabaseHandler);
+begin
+  Create(AOwner);
+  FDBHandler := ADBHandler;
 end;
 
 destructor TfrmLogViewer.Destroy;
@@ -702,6 +715,7 @@ begin
   RxDBGrid.TitleFont.Style := [fsBold];
 end;
 
+
 procedure TfrmLogViewer.FormShow(Sender: TObject);
 begin
   RefreshData;
@@ -729,6 +743,8 @@ var
   LastID: Integer;
   ScrollToEnd: Boolean;
   SavedCursor: TCursor;
+  TempQuery: TZQuery;
+  SearchText: string;
 begin
   SavedCursor := Screen.Cursor;
   Screen.Cursor := crHourGlass;  // 모래시계 커서 표시
@@ -744,15 +760,45 @@ begin
     // 자동 스크롤 설정 확인
     ScrollToEnd := chkAutoScroll.Checked;
 
-    // 쿼리 실행
-    LogQuery.Close;
-    LogQuery.SQL.Text :=
-      'SELECT ID, LDATE, LTIME, LLEVEL, LSOURCE, LMESSAGE ' +
-      'FROM LOGS ' +
-      'ORDER BY ID DESC';
-    LogQuery.Open;
+    // GlobalLogger에서 DatabaseHandler 찾기
+    if not Assigned(FDBHandler) then
+    begin
+      // DatabaseHandler가 없으면 기존 방식으로 조회 (단일 테이블)
+      LogQuery.Close;
+      LogQuery.SQL.Text :=
+        'SELECT ID, LDATE, LTIME, LLEVEL, LSOURCE, LMESSAGE ' +
+        'FROM LOGS ' +
+        'ORDER BY ID DESC';
+      LogQuery.Open;
+    end
+    else
+    begin
+      // 검색어
+      SearchText := Trim(edtSearch.Text);
 
-    // 필터 적용
+      // DatabaseHandler의 GetLogs 메서드 사용하여 로그 조회
+      TempQuery := FDBHandler.GetLogs(
+        DateFrom.Date,       // 시작일
+        DateTo.Date,         // 종료일
+        '',                  // 로그 레벨 필터 (비워두고 UI에서 처리)
+        SearchText           // 검색어
+      );
+
+      // 기존 쿼리 닫기
+      if LogQuery.Active then
+        LogQuery.Close;
+
+      // 쿼리 복사
+      LogQuery.SQL.Text := TempQuery.SQL.Text;
+      LogQuery.Params.Assign(TempQuery.Params);
+      LogQuery.Open;
+
+      // 임시 쿼리 해제
+      TempQuery.Close;
+      TempQuery.Free;
+    end;
+
+    // 로그 레벨 필터 적용
     ApplyFilter;
 
     // 마지막 위치로 이동 또는 맨 끝으로 이동
@@ -766,7 +812,7 @@ begin
     end;
 
     // 로그 레코드 카운트 업데이트
-    //UpdateRowCount;
+    UpdateRowCount;
   finally
     Screen.Cursor := SavedCursor;  // 원래 커서로 복원
   end;
@@ -774,24 +820,12 @@ end;
 
 procedure TfrmLogViewer.ApplyFilter;
 var
-  WhereClause: string;
-  DateFilter: string;
-  LevelFilter: string;
-  SearchFilter: string;
-  SearchText: string;
-  i: Integer;
+  FilterStr: string;
   SelectedLevels: TStringList;
+  i: Integer;
 begin
   FClearingFilter := True;
   try
-    // SQL WHERE 절을 직접 구성하는 방식으로 변경
-    WhereClause := '';
-
-    // 날짜 필터
-    DateFilter := Format('(LDATE >= ''%s'') AND (LDATE <= ''%s'')',
-                       [FormatDateTime('yyyy-mm-dd', DateFrom.Date),
-                        FormatDateTime('yyyy-mm-dd', DateTo.Date)]);
-
     // 로그 레벨 필터 - 체크박스 방식
     SelectedLevels := TStringList.Create;
     try
@@ -808,67 +842,46 @@ begin
       if chkDEVEL.Checked then
         SelectedLevels.Add('DEVEL');
 
-      if SelectedLevels.Count > 0 then
+      // 모든 로그 레벨이 선택된 경우 필터 해제
+      if SelectedLevels.Count = 6 then
       begin
-        LevelFilter := '(';
+        LogQuery.Filtered := False;
+      end
+      else if SelectedLevels.Count > 0 then
+      begin
+        // 일부 로그 레벨만 선택된 경우
+        FilterStr := '';
         for i := 0 to SelectedLevels.Count - 1 do
         begin
           if i > 0 then
-            LevelFilter := LevelFilter + ' OR ';
-          LevelFilter := LevelFilter + Format('LLEVEL = ''%s''', [SelectedLevels[i]]);
+            FilterStr := FilterStr + ' OR ';
+          FilterStr := FilterStr + Format('LLEVEL = ''%s''', [SelectedLevels[i]]);
         end;
-        LevelFilter := LevelFilter + ')';
+
+        // 필터 적용
+        LogQuery.Filter := '(' + FilterStr + ')';
+        LogQuery.Filtered := True;
       end
       else
-        LevelFilter := '';
+      begin
+        // 어떤 로그 레벨도 선택되지 않은 경우 (모든 로그 숨김)
+        LogQuery.Filter := 'LLEVEL = ''NONE''';
+        LogQuery.Filtered := True;
+      end;
     finally
       SelectedLevels.Free;
     end;
-
-    // 검색어 필터 - LIKE 연산자 사용
-    SearchText := Trim(edtSearch.Text);
-    if SearchText <> '' then
-    begin
-      // 작은따옴표 처리
-      SearchText := StringReplace(SearchText, '''', '''''', [rfReplaceAll]);
-
-      // LIKE 연산자를 사용해 패턴 매칭
-      SearchFilter := Format('((LSOURCE LIKE ''%%%s%%'') OR (LMESSAGE LIKE ''%%%s%%''))',
-                        [SearchText, SearchText]);
-    end
-    else
-      SearchFilter := '';
-
-    // WHERE 절 결합
-    if DateFilter <> '' then
-      WhereClause := DateFilter;
-
-    if LevelFilter <> '' then
-    begin
-      if WhereClause <> '' then
-        WhereClause := WhereClause + ' AND ' + LevelFilter
-      else
-        WhereClause := LevelFilter;
-    end;
-
-    if SearchFilter <> '' then
-    begin
-      if WhereClause <> '' then
-        WhereClause := WhereClause + ' AND ' + SearchFilter
-      else
-        WhereClause := SearchFilter;
-    end;
-
-    // SQL 필터 적용
-    TryApplyFilterWithSQL(WhereClause);
   finally
     FClearingFilter := False;
-    //UpdateRowCount;
+    UpdateRowCount;
   end;
 end;
 
 procedure TfrmLogViewer.TryApplyFilterWithSQL(const WhereClause: string);
 begin
+  // 월별 테이블 구조에서는 이 메서드는 더 이상 사용되지 않음
+  // GetDatabaseHandler.GetLogs 메서드가 대신 사용됨
+
   // 필터를 SQL WHERE 절로 적용
   try
     LogQuery.Close;
@@ -956,14 +969,71 @@ begin
 end;
 
 procedure TfrmLogViewer.btnClearLogClick(Sender: TObject);
+var
+  LogTables: TStringList;
+  i: Integer;
 begin
   if MessageDlg('경고', '모든 로그 기록을 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.',
      mtWarning, [mbYes, mbNo], 0) = mrYes then
   begin
     try
-      LogQuery.Close;
-      LogQuery.SQL.Text := 'DELETE FROM LOGS';
-      LogQuery.ExecSQL;
+      // DatabaseHandler 얻기
+      if not Assigned(FDBHandler) then
+      begin
+        // 기존 단일 테이블 방식
+        LogQuery.Close;
+        LogQuery.SQL.Text := 'DELETE FROM LOGS';
+        LogQuery.ExecSQL;
+      end
+      else
+      begin
+        // 월별 테이블 방식
+        LogTables := TStringList.Create;
+        try
+          LogQuery.Close;
+
+          // 메타 테이블 비우기
+          LogQuery.SQL.Text := 'DELETE FROM ' + FDBHandler.MetaTableName;
+          LogQuery.ExecSQL;
+
+          // 테이블 목록 조회
+          LogQuery.SQL.Text :=
+            'SELECT RDB$RELATION_NAME FROM RDB$RELATIONS ' +
+            'WHERE RDB$RELATION_NAME LIKE ''LOGS_%'' AND RDB$SYSTEM_FLAG = 0';
+          LogQuery.Open;
+
+          while not LogQuery.EOF do
+          begin
+            LogTables.Add(Trim(LogQuery.FieldByName('RDB$RELATION_NAME').AsString));
+            LogQuery.Next;
+          end;
+
+          LogQuery.Close;
+
+          // 모든 로그 테이블 삭제
+          for i := 0 to LogTables.Count - 1 do
+          begin
+            try
+              // 시퀀스 삭제
+              LogQuery.SQL.Text := 'DROP SEQUENCE SEQ_' + LogTables[i];
+              LogQuery.ExecSQL;
+
+              // 테이블 삭제
+              LogQuery.SQL.Text := 'DROP TABLE ' + LogTables[i];
+              LogQuery.ExecSQL;
+            except
+              // 테이블 삭제 중 오류는 무시하고 계속 진행
+              on E: Exception do
+                ; // 무시
+            end;
+          end;
+        finally
+          LogTables.Free;
+        end;
+
+        // 현재 월 테이블 재생성 (DBHandler 초기화)
+        FDBHandler.Init;
+      end;
 
       RefreshData;
       ShowMessage('모든 로그가 삭제되었습니다.');
@@ -989,17 +1059,19 @@ procedure TfrmLogViewer.btnSearchClearClick(Sender: TObject);
 begin
   edtSearch.Clear;
 
-  // 체크박스 초기화 - INFO만 선택
+  // 체크박스 초기화 - 모두 선택
   chkINFO.Checked := True;
-  chkDEBUG.Checked := False;
-  chkWARN.Checked := False;
-  chkERROR.Checked := False;
-  chkFATAL.Checked := False;
-  chkDEVEL.Checked := False;
+  chkDEBUG.Checked := True;
+  chkWARN.Checked := True;
+  chkERROR.Checked := True;
+  chkFATAL.Checked := True;
+  chkDEVEL.Checked := True;
 
   DateFrom.Date := Date - 7;
   DateTo.Date := Date;
-  ApplyFilter;
+
+  // 데이터 새로고침
+  RefreshData;
 end;
 
 procedure TfrmLogViewer.btnSaveSearchClick(Sender: TObject);
@@ -1057,120 +1129,10 @@ begin
       DateTo.Date := FSearchHistory[SelectedIdx].DateTo;
 
       // 필터 적용
-      ApplyFilter;
+      RefreshData;
     end;
   finally
     Items.Free;
-  end;
-end;
-
-function SelectFromList(const Title, Prompt: string; Items: TStrings): Integer;
-var
-  Form: TForm;
-  Label1: TLabel;
-  ListBox: TListBox;
-  ButtonPanel: TPanel;
-  OKButton, CancelButton: TButton;
-begin
-  Result := -1;
-
-  Form := TForm.Create(nil);
-  try
-    Form.Caption := Title;
-    Form.Position := poScreenCenter;
-    Form.BorderStyle := bsDialog;
-    Form.Width := 350;
-    Form.Height := 300;
-
-    Label1 := TLabel.Create(Form);
-    Label1.Parent := Form;
-    Label1.Caption := Prompt;
-    Label1.Left := 8;
-    Label1.Top := 8;
-
-    ListBox := TListBox.Create(Form);
-    ListBox.Parent := Form;
-    ListBox.Left := 8;
-    ListBox.Top := 24;
-    ListBox.Width := Form.ClientWidth - 16;
-    ListBox.Height := Form.ClientHeight - 80;
-    ListBox.Items.Assign(Items);
-    if ListBox.Items.Count > 0 then
-      ListBox.ItemIndex := 0;
-
-    ButtonPanel := TPanel.Create(Form);
-    ButtonPanel.Parent := Form;
-    ButtonPanel.Align := alBottom;
-    ButtonPanel.Height := 40;
-    ButtonPanel.BevelOuter := bvNone;
-
-    OKButton := TButton.Create(Form);
-    OKButton.Parent := ButtonPanel;
-    OKButton.Caption := '확인';
-    OKButton.ModalResult := mrOK;
-    OKButton.Left := ButtonPanel.Width - 160;
-    OKButton.Top := 8;
-    OKButton.Width := 75;
-
-    CancelButton := TButton.Create(Form);
-    CancelButton.Parent := ButtonPanel;
-    CancelButton.Caption := '취소';
-    CancelButton.ModalResult := mrCancel;
-    CancelButton.Left := ButtonPanel.Width - 80;
-    CancelButton.Top := 8;
-    CancelButton.Width := 75;
-
-    if Form.ShowModal = mrOK then
-      Result := ListBox.ItemIndex;
-  finally
-    Form.Free;
-  end;
-end;
-
-procedure TfrmLogViewer.LoadSearchHistory;
-var
-  IniFile: TIniFile;
-  i, Count: Integer;
-  Section: string;
-begin
-  IniFile := TIniFile.Create(ExtractFilePath(ParamStr(0)) + 'LogViewer.ini');
-  try
-    Count := IniFile.ReadInteger('SearchHistory', 'Count', 0);
-    SetLength(FSearchHistory, Count);
-
-    for i := 0 to Count - 1 do
-    begin
-      Section := 'Search_' + IntToStr(i);
-      FSearchHistory[i].SearchText := IniFile.ReadString(Section, 'SearchText', '');
-      FSearchHistory[i].LogLevel := IniFile.ReadInteger(Section, 'LogLevel', 0);
-      FSearchHistory[i].DateFrom := StrToDateDef(IniFile.ReadString(Section, 'DateFrom', ''), Date - 7);
-      FSearchHistory[i].DateTo := StrToDateDef(IniFile.ReadString(Section, 'DateTo', ''), Date);
-    end;
-  finally
-    IniFile.Free;
-  end;
-end;
-
-procedure TfrmLogViewer.SaveSearchHistory;
-var
-  IniFile: TIniFile;
-  i: Integer;
-  Section: string;
-begin
-  IniFile := TIniFile.Create(ExtractFilePath(ParamStr(0)) + 'LogViewer.ini');
-  try
-    IniFile.WriteInteger('SearchHistory', 'Count', Length(FSearchHistory));
-
-    for i := 0 to High(FSearchHistory) do
-    begin
-      Section := 'Search_' + IntToStr(i);
-      IniFile.WriteString(Section, 'SearchText', FSearchHistory[i].SearchText);
-      IniFile.WriteInteger(Section, 'LogLevel', FSearchHistory[i].LogLevel);
-      IniFile.WriteString(Section, 'DateFrom', FormatDateTime('yyyy-mm-dd', FSearchHistory[i].DateFrom));
-      IniFile.WriteString(Section, 'DateTo', FormatDateTime('yyyy-mm-dd', FSearchHistory[i].DateTo));
-    end;
-  finally
-    IniFile.Free;
   end;
 end;
 
@@ -1182,7 +1144,7 @@ begin
 
   // 모드 변경 시 필터 다시 적용
   if not FLoading then
-    ApplyFilter;
+    RefreshData;
 end;
 
 procedure TfrmLogViewer.clbLogLevelsClickCheck(Sender: TObject);
@@ -1203,7 +1165,7 @@ begin
     DateTo.Date := DateFrom.Date;
 
   if not FClearingFilter then
-    ApplyFilter;
+    RefreshData;
 end;
 
 procedure TfrmLogViewer.DateToChange(Sender: TObject);
@@ -1212,7 +1174,7 @@ begin
     DateFrom.Date := DateTo.Date;
 
   if not FClearingFilter then
-    ApplyFilter;
+    RefreshData;
 end;
 
 procedure TfrmLogViewer.edtRefreshIntervalChange(Sender: TObject);
@@ -1224,7 +1186,7 @@ end;
 procedure TfrmLogViewer.edtSearchChange(Sender: TObject);
 begin
   if not FClearingFilter then
-    ApplyFilter;
+    RefreshData;
 end;
 
 procedure TfrmLogViewer.TimerRefreshTimer(Sender: TObject);
@@ -1459,7 +1421,11 @@ end;
 
 procedure TfrmLogViewer.DeleteFilteredLogs;
 var
-  SQL, WhereClause: string;
+  LogLevels: TStringList;
+  SearchStr: string;
+  i: Integer;
+  DeleteSQL: string;
+  DeleteQuery: TZQuery;
 begin
   if LogQuery.IsEmpty then
   begin
@@ -1472,33 +1438,225 @@ begin
      mtWarning, [mbYes, mbNo], 0) <> mrYes then
     Exit;
 
-  // WHERE 절 추출
-  WhereClause := '';
-  SQL := LogQuery.SQL.Text;
-  if Pos('WHERE', UpperCase(SQL)) > 0 then
-  begin
-    WhereClause := Copy(SQL,
-                       Pos('WHERE', UpperCase(SQL)) + 5,
-                       Pos('ORDER', UpperCase(SQL)) - Pos('WHERE', UpperCase(SQL)) - 5);
-  end;
-
-  if WhereClause = '' then
-  begin
-    ShowMessage('필터 조건을 추출할 수 없습니다.');
-    Exit;
-  end;
-
   try
-    LogQuery.Close;
-    LogQuery.SQL.Text := 'DELETE FROM LOGS WHERE ' + WhereClause;
-    LogQuery.ExecSQL;
+    // 로그 레벨 목록
+    LogLevels := TStringList.Create;
+    try
+      if chkINFO.Checked then LogLevels.Add('INFO');
+      if chkDEBUG.Checked then LogLevels.Add('DEBUG');
+      if chkWARN.Checked then LogLevels.Add('WARNING');
+      if chkERROR.Checked then LogLevels.Add('ERROR');
+      if chkFATAL.Checked then LogLevels.Add('FATAL');
+      if chkDEVEL.Checked then LogLevels.Add('DEVEL');
 
-    ShowMessage(Format('총 %d개의 로그가 삭제되었습니다.', [LogQuery.RowsAffected]));
+      // 검색어
+      SearchStr := Trim(edtSearch.Text);
 
+      if Assigned(FDBHandler) then
+      begin
+        // 월별 테이블 방식
+        // GetTablesBetweenDates 메서드가 없으므로 대체 방법 사용
+
+        // 메타 테이블을 통해 테이블 목록 조회
+        LogQuery.Close;
+        LogQuery.SQL.Text :=
+          'SELECT TABLE_NAME FROM ' + FDBHandler.MetaTableName + ' ' +
+          'WHERE (YEAR_MONTH >= :StartYM AND YEAR_MONTH <= :EndYM)';
+        LogQuery.ParamByName('StartYM').AsString := FormatDateTime('YYYYMM', DateFrom.Date);
+        LogQuery.ParamByName('EndYM').AsString := FormatDateTime('YYYYMM', DateTo.Date);
+        LogQuery.Open;
+
+        // 각 테이블별로 삭제 실행
+        while not LogQuery.EOF do
+        begin
+          DeleteSQL := 'DELETE FROM ' + LogQuery.FieldByName('TABLE_NAME').AsString +
+                       ' WHERE LDATE >= :StartDate AND LDATE <= :EndDate';
+
+          // 로그 레벨 필터 추가
+          if (LogLevels.Count > 0) and (LogLevels.Count < 6) then
+          begin
+            DeleteSQL := DeleteSQL + ' AND (';
+            for i := 0 to LogLevels.Count - 1 do
+            begin
+              if i > 0 then DeleteSQL := DeleteSQL + ' OR ';
+              DeleteSQL := DeleteSQL + 'LLEVEL = ''' + LogLevels[i] + '''';
+            end;
+            DeleteSQL := DeleteSQL + ')';
+          end;
+
+          // 검색어 필터 추가
+          if SearchStr <> '' then
+          begin
+            DeleteSQL := DeleteSQL + Format(' AND ((LSOURCE LIKE ''%%%s%%'') OR (LMESSAGE LIKE ''%%%s%%''))',
+                         [SearchStr, SearchStr]);
+          end;
+
+          // 삭제 쿼리 실행
+          DeleteQuery := TZQuery.Create(nil);
+          try
+            DeleteQuery.Connection := LogConnection;
+            DeleteQuery.SQL.Text := DeleteSQL;
+            DeleteQuery.ParamByName('StartDate').AsDate := DateFrom.Date;
+            DeleteQuery.ParamByName('EndDate').AsDate := DateTo.Date;
+            DeleteQuery.ExecSQL;
+          finally
+            DeleteQuery.Free;
+          end;
+
+          LogQuery.Next;
+        end;
+      end
+      else
+      begin
+        // 단일 테이블 방식 (이전 버전 호환)
+        DeleteSQL := 'DELETE FROM LOGS WHERE LDATE >= :StartDate AND LDATE <= :EndDate';
+
+        // 로그 레벨 필터 추가
+        if (LogLevels.Count > 0) and (LogLevels.Count < 6) then
+        begin
+          DeleteSQL := DeleteSQL + ' AND (';
+          for i := 0 to LogLevels.Count - 1 do
+          begin
+            if i > 0 then DeleteSQL := DeleteSQL + ' OR ';
+            DeleteSQL := DeleteSQL + 'LLEVEL = ''' + LogLevels[i] + '''';
+          end;
+          DeleteSQL := DeleteSQL + ')';
+        end;
+
+        // 검색어 필터 추가
+        if SearchStr <> '' then
+        begin
+          DeleteSQL := DeleteSQL + Format(' AND ((LSOURCE LIKE ''%%%s%%'') OR (LMESSAGE LIKE ''%%%s%%''))',
+                       [SearchStr, SearchStr]);
+        end;
+
+        // 삭제 쿼리 실행
+        LogQuery.Close;
+        LogQuery.SQL.Text := DeleteSQL;
+        LogQuery.ParamByName('StartDate').AsDate := DateFrom.Date;
+        LogQuery.ParamByName('EndDate').AsDate := DateTo.Date;
+        LogQuery.ExecSQL;
+      end;
+    finally
+      LogLevels.Free;
+    end;
+
+    // 데이터 새로고침
     RefreshData;
+    ShowMessage('필터링된 로그가 삭제되었습니다.');
   except
     on E: Exception do
       ShowMessage('로그 삭제 중 오류가 발생했습니다: ' + E.Message);
+  end;
+end;
+
+procedure TfrmLogViewer.LoadSearchHistory;
+var
+  IniFile: TIniFile;
+  i, Count: Integer;
+  Section: string;
+begin
+  IniFile := TIniFile.Create(ExtractFilePath(ParamStr(0)) + 'LogViewer.ini');
+  try
+    Count := IniFile.ReadInteger('SearchHistory', 'Count', 0);
+    SetLength(FSearchHistory, Count);
+
+    for i := 0 to Count - 1 do
+    begin
+      Section := 'Search_' + IntToStr(i);
+      FSearchHistory[i].SearchText := IniFile.ReadString(Section, 'SearchText', '');
+      FSearchHistory[i].LogLevel := IniFile.ReadInteger(Section, 'LogLevel', 0);
+      FSearchHistory[i].DateFrom := StrToDateDef(IniFile.ReadString(Section, 'DateFrom', ''), Date - 7);
+      FSearchHistory[i].DateTo := StrToDateDef(IniFile.ReadString(Section, 'DateTo', ''), Date);
+    end;
+  finally
+    IniFile.Free;
+  end;
+end;
+
+procedure TfrmLogViewer.SaveSearchHistory;
+var
+  IniFile: TIniFile;
+  i: Integer;
+  Section: string;
+begin
+  IniFile := TIniFile.Create(ExtractFilePath(ParamStr(0)) + 'LogViewer.ini');
+  try
+    IniFile.WriteInteger('SearchHistory', 'Count', Length(FSearchHistory));
+
+    for i := 0 to High(FSearchHistory) do
+    begin
+      Section := 'Search_' + IntToStr(i);
+      IniFile.WriteString(Section, 'SearchText', FSearchHistory[i].SearchText);
+      IniFile.WriteInteger(Section, 'LogLevel', FSearchHistory[i].LogLevel);
+      IniFile.WriteString(Section, 'DateFrom', FormatDateTime('yyyy-mm-dd', FSearchHistory[i].DateFrom));
+      IniFile.WriteString(Section, 'DateTo', FormatDateTime('yyyy-mm-dd', FSearchHistory[i].DateTo));
+    end;
+  finally
+    IniFile.Free;
+  end;
+end;
+
+function SelectFromList(const Title, Prompt: string; Items: TStrings): Integer;
+var
+  Form: TForm;
+  Label1: TLabel;
+  ListBox: TListBox;
+  ButtonPanel: TPanel;
+  OKButton, CancelButton: TButton;
+begin
+  Result := -1;
+
+  Form := TForm.Create(nil);
+  try
+    Form.Caption := Title;
+    Form.Position := poScreenCenter;
+    Form.BorderStyle := bsDialog;
+    Form.Width := 350;
+    Form.Height := 300;
+
+    Label1 := TLabel.Create(Form);
+    Label1.Parent := Form;
+    Label1.Caption := Prompt;
+    Label1.Left := 8;
+    Label1.Top := 8;
+
+    ListBox := TListBox.Create(Form);
+    ListBox.Parent := Form;
+    ListBox.Left := 8;
+    ListBox.Top := 24;
+    ListBox.Width := Form.ClientWidth - 16;
+    ListBox.Height := Form.ClientHeight - 80;
+    ListBox.Items.Assign(Items);
+    if ListBox.Items.Count > 0 then
+      ListBox.ItemIndex := 0;
+
+    ButtonPanel := TPanel.Create(Form);
+    ButtonPanel.Parent := Form;
+    ButtonPanel.Align := alBottom;
+    ButtonPanel.Height := 40;
+    ButtonPanel.BevelOuter := bvNone;
+
+    OKButton := TButton.Create(Form);
+    OKButton.Parent := ButtonPanel;
+    OKButton.Caption := '확인';
+    OKButton.ModalResult := mrOK;
+    OKButton.Left := ButtonPanel.Width - 160;
+    OKButton.Top := 8;
+    OKButton.Width := 75;
+
+    CancelButton := TButton.Create(Form);
+    CancelButton.Parent := ButtonPanel;
+    CancelButton.Caption := '취소';
+    CancelButton.ModalResult := mrCancel;
+    CancelButton.Left := ButtonPanel.Width - 80;
+    CancelButton.Top := 8;
+    CancelButton.Width := 75;
+
+    if Form.ShowModal = mrOK then
+      Result := ListBox.ItemIndex;
+  finally
+    Form.Free;
   end;
 end;
 
