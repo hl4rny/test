@@ -763,13 +763,8 @@ begin
     // GlobalLogger에서 DatabaseHandler 찾기
     if not Assigned(FDBHandler) then
     begin
-      // DatabaseHandler가 없으면 기존 방식으로 조회 (단일 테이블)
-      LogQuery.Close;
-      LogQuery.SQL.Text :=
-        'SELECT ID, LDATE, LTIME, LLEVEL, LSOURCE, LMESSAGE ' +
-        'FROM LOGS ' +
-        'ORDER BY ID DESC';
-      LogQuery.Open;
+      // DatabaseHandler가 없으면
+      DebugToFile('FDBHandler가 등록되어 있지 않음.');
     end
     else
     begin

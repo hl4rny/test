@@ -94,33 +94,13 @@ type
   end;
 
 // GlobalLogger에서 DatabaseHandler 인스턴스를 찾는 함수
-function GetDatabaseHandler: TDatabaseHandler;
+//function GetDatabaseHandler: TDatabaseHandler;
 
 implementation
 
 uses
   GlobalLogger;
 
-// GlobalLogger에서 DatabaseHandler 인스턴스를 찾는 전역 함수 구현
-function GetDatabaseHandler: TDatabaseHandler;
-var
-  i: Integer;
-begin
-  Result := nil;
-
-  if not Assigned(GlobalLogger.Logger) then
-    Exit;
-
-  // GlobalLogger의 LogHandlers에서 TDatabaseHandler 찾기
-  for i := 0 to GlobalLogger.Logger.LogHandlerCount - 1 do
-  begin
-    if GlobalLogger.Logger.LogHandlers[i] is TDatabaseHandler then
-    begin
-      Result := TDatabaseHandler(GlobalLogger.Logger.LogHandlers[i]);
-      Break;
-    end;
-  end;
-end;
 
 { TDatabaseHandler }
 
