@@ -9,7 +9,7 @@ uses
   // 기본 로그 핸들러
   LogHandlers, FileHandler, MemoHandler, ConsoleHandler,
   // 확장 핸들러 모듈
-  NetworkHandler, BufferedHandler, SerialHandler, PrintfHandler,
+  NetworkHandler, BufferedHandler, SerialHandler, PrintfHandler, DatabaseHandler,
   // 새로 통합된 모듈
   LogServerHandler, // 로그 서버 기능
   LogEmailHandler,  // 이메일 알림 기능
@@ -202,6 +202,7 @@ type
     function AddConsoleHandler: TConsoleHandler;
     function AddNetworkHandler(const Host: string; Port: Integer): TNetworkHandler;
     function AddSerialHandler(ASerialPort: TComPort = nil; OwnsPort: Boolean = True): TSerialHandler; // 시리얼 핸들러
+    function AddDatabaseHandler(const AHost, ADatabase, AUser, APassword: string): TDatabaseHandler;
 
     // 초기화 메서드 - 이전의 Configure와 유사한 기능
     procedure Configure(const LogPath, FilePrefix: string;
@@ -259,7 +260,8 @@ type
 // 간편한 전역 액세스 함수
 function Logger: TGlobalLogger;
 function GetPrintfHandler: TPrintfHandler;
-
+// 다른 유닛에서 접근할 수 있도록 interface 섹션에 함수 선언
+procedure DebugToFile(const Msg: string);
 
 implementation
 
@@ -948,6 +950,13 @@ begin
   finally
     FLock.Leave;
   end;
+end;
+
+// DatabaseHandler
+function TGlobalLogger.AddDatabaseHandler(const AHost, ADatabase, AUser, APassword: string): TDatabaseHandler;
+begin
+  Result := TDatabaseHandler.Create(AHost, ADatabase, AUser, APassword);
+  AddHandler(Result);
 end;
 
 

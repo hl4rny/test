@@ -1,3 +1,4 @@
+// DatabaseHandler.pas 파일 내용
 unit DatabaseHandler;
 
 {$mode objfpc}{$H+}
@@ -5,720 +6,596 @@ unit DatabaseHandler;
 interface
 
 uses
-  Classes, SysUtils, ZConnection, ZDataset, ZDbcIntfs,
-  DateUtils, StrUtils, Forms, Dialogs,
-  // GlobalLogger 시스템 모듈
-  GlobalLogger, LogHandlers, SourceIdentifier;
+  Classes, SysUtils, DateUtils, LogHandlers, SyncObjs, ZConnection, ZDataset;
 
 type
-  { TDatabaseLogHandler }
-  TDatabaseLogHandler = class(TLogHandler)
-  private
-    FDBConnection: TZConnection;
-    FMetaQuery: TZQuery;
-    FLogQuery: TZQuery;
-    FCurrentLogTable: string;
-    FAppPath: string;
-    FLastTableCheck: TDateTime;
-    FTableCheckInterval: Integer; // 테이블 존재 확인 간격 (분)
-    FRetentionMonths: Integer;    // 로그 유지 기간 (월)
-    FMetaTableName: string;
+  // 로그 큐 아이템 (비동기 처리용)
+  TDBLogQueueItem = record
+    Message: string;
+    Level: TLogLevel;
+    Tag: string;
+  end;
+  PDBLogQueueItem = ^TDBLogQueueItem;
 
-    procedure InitializeConnection;
-    function CreateDatabase: Boolean;
-    function ConnectToDatabase: Boolean;
-    procedure EnsureMetaTableExists;
-    procedure EnsureCurrentLogTableExists;
-    function GetCurrentTableName: string;
-    function TableExists(const ATableName: string): Boolean;
-    function RegisterLogTable(const ATableName, AYearMonth: string): Boolean;
-    function UpdateLogTableMetrics(const ATableName: string): Boolean;
-    procedure ManageLogTables;
-    function GetTableDate(const ATableName: string; out ADate: TDateTime): Boolean;
-    function GetLogTableList: TStringList;
-    function ExecuteSQL(const ASQL: string): Boolean;
-    function GetDatabaseFilePath: string;
-    function GetClientLibPath: string;
+  { TDatabaseHandler - 데이터베이스 로그 핸들러 }
+  TDatabaseHandler = class(TLogHandler)
+  private
+    FConnection: TZConnection;       // 데이터베이스 연결
+    FLogQuery: TZQuery;              // 로그 쿼리
+    FTableName: string;              // 로그 테이블 이름
+    FAutoCreateTable: Boolean;       // 테이블 자동 생성 여부
+    FQueueMaxSize: Integer;          // 큐 최대 크기
+    FQueueFlushInterval: Integer;    // 큐 자동 플러시 간격
+    FLastQueueFlush: TDateTime;      // 마지막 큐 플러시 시간
+    FRetentionMonths: Integer;       // 로그 데이터 보관 개월 수
+    FLastCleanupDate: TDateTime;     // 마지막 정리 날짜
+
+    // 비동기 처리 관련 필드
+    FLogQueue: TThreadList;          // 로그 메시지 큐
+
+    function BuildSourceIdentifier(const ATag: string): string;
+    function LogLevelToStr(ALevel: TLogLevel): string;
+    procedure CreateLogTable;        // 로그 테이블 생성
+    procedure FlushQueue;            // 큐에 있는 로그 처리
+    procedure CleanupOldLogs;        // 오래된 로그 정리
 
   protected
-    procedure DoWriteLog(const AMsg: string; const ALevel: TLogLevel;
-                        const ATag: string = ''); override;
-    procedure SetFormatSettings; override;
+    procedure WriteLog(const Msg: string; Level: TLogLevel); override;
 
   public
-    constructor Create; override;
+    constructor Create(const AHost, ADatabase, AUser, APassword: string); reintroduce;
     destructor Destroy; override;
 
-    // GlobalLogger 시스템에 통합되므로 핸들러 초기화 및 LogLevel 설정
-    procedure Initialize; override;
-    procedure SetLogLevels(const ALevels: TLogLevelSet); override;
+    procedure Init; override;
+    procedure Shutdown; override;
 
-    // 로그 테이블 조회 기능
-    function GetLogs(const AFromDate, AToDate: TDateTime;
-                    const ALevel: TLogLevel = llInfo;
-                    const ATag: string = ''): TStringList;
+    // 데이터베이스 연결 설정
+    procedure SetConnection(const AHost, ADatabase, AUser, APassword: string);
 
-    // 유지보수 관련 기능
-    procedure PerformMaintenance;
-
+    // 속성
+    property TableName: string read FTableName write FTableName;
+    property AutoCreateTable: Boolean read FAutoCreateTable write FAutoCreateTable;
+    property QueueMaxSize: Integer read FQueueMaxSize write FQueueMaxSize;
+    property QueueFlushInterval: Integer read FQueueFlushInterval write FQueueFlushInterval;
     property RetentionMonths: Integer read FRetentionMonths write FRetentionMonths;
   end;
 
 implementation
 
-{ TDatabaseLogHandler }
+uses
+  GlobalLogger;
 
-constructor TDatabaseLogHandler.Create;
+
+{ TDatabaseHandler }
+
+constructor TDatabaseHandler.Create(const AHost, ADatabase, AUser, APassword: string);
 begin
   inherited Create;
 
-  FAppPath := ExtractFilePath(Application.ExeName);
-  SourceIdentifier := 'DB';
-  FLastTableCheck := 0;
-  FTableCheckInterval := 5; // 5분마다 테이블 확인
-  FRetentionMonths := 12;   // 기본 12개월 보관
-  FMetaTableName := 'LOG_META';
+  try
+    // 기본값 설정
+    FTableName := 'LOGS';
+    FAutoCreateTable := True;
+    FRetentionMonths := 3;          // 기본 3개월 보관
+    FLastCleanupDate := 0;          // 초기값 0으로 설정해 첫 로그 작성시 정리 실행
 
-  FDBConnection := TZConnection.Create(nil);
-  FMetaQuery := TZQuery.Create(nil);
-  FLogQuery := TZQuery.Create(nil);
+    // 데이터베이스 객체 생성
+    FConnection := TZConnection.Create(nil);
+    FLogQuery := TZQuery.Create(nil);
+    FLogQuery.Connection := FConnection;
 
-  FMetaQuery.Connection := FDBConnection;
-  FLogQuery.Connection := FDBConnection;
+    // 비동기 처리 관련
+    FLogQueue := TThreadList.Create;
+    FQueueMaxSize := 100;           // 기본 큐 크기
+    FQueueFlushInterval := 5000;    // 기본 플러시 간격 (ms)
+    FLastQueueFlush := Now;
 
-  InitializeConnection;
+    // 연결 정보 설정
+    SetConnection(AHost, ADatabase, AUser, APassword);
+  except
+    on E: Exception do
+      DebugToFile('DatabaseHandler 초기화 오류: ' + E.Message);
+  end;
 end;
 
-destructor TDatabaseLogHandler.Destroy;
+destructor TDatabaseHandler.Destroy;
 begin
-  if FDBConnection.Connected then
-  begin
-    // 접속 종료 전 메타데이터 업데이트
-    if FCurrentLogTable <> '' then
-      UpdateLogTableMetrics(FCurrentLogTable);
+  try
+    Shutdown;
 
-    FDBConnection.Disconnect;
+    // 로그 큐 정리
+    FlushQueue;
+    FLogQueue.Free;
+
+    // 데이터베이스 객체 해제
+    if Assigned(FLogQuery) then
+      FreeAndNil(FLogQuery);
+    if Assigned(FConnection) then
+      FreeAndNil(FConnection);
+  except
+    on E: Exception do
+      DebugToFile('DatabaseHandler 소멸자 오류: ' + E.Message);
   end;
-
-  FLogQuery.Free;
-  FMetaQuery.Free;
-  FDBConnection.Free;
 
   inherited;
 end;
 
-procedure TDatabaseLogHandler.Initialize;
+procedure TDatabaseHandler.Init;
 begin
   inherited;
 
-  // 전체 로그 레벨 활성화
-  LogLevels := [llDevelop, llDebug, llInfo, llWarning, llError, llFatal];
-
-  // 필요한 경우 여기에 추가 초기화 코드 작성
-end;
-
-procedure TDatabaseLogHandler.SetLogLevels(const ALevels: TLogLevelSet);
-begin
-  inherited;
-  // 추가 작업이 필요한 경우 여기에 구현
-end;
-
-procedure TDatabaseLogHandler.SetFormatSettings;
-begin
-  inherited;
-
-  // 로그 출력 형식 설정
-  TimestampFormat := 'yyyy-mm-dd hh:nn:ss.zzz';
-  IncludeDate := True;
-  IncludeTime := True;
-  IncludeMilliseconds := True;
-end;
-
-procedure TDatabaseLogHandler.InitializeConnection;
-begin
   try
-    // 데이터베이스 디렉토리 확인 및 생성
-    ForceDirectories(FAppPath + 'log');
-
-    // DB 연결 설정
-    with FDBConnection do
+    // 데이터베이스 연결이 이미 설정되어 있으면 연결 시도
+    if (FConnection.HostName <> '') and (FConnection.Database <> '') then
     begin
-      Protocol := 'firebird';
-      ClientCodepage := 'UTF8';
-      LibraryLocation := GetClientLibPath;
-      Database := GetDatabaseFilePath;
-      User := 'SYSDBA';
-      Password := 'masterkey';
-      Properties.Clear;
-      Properties.Values['dialect'] := '3';
-      Port := 0;
-      Catalog := '';
-      HostName := '';
-    end;
-
-    // DB 생성 및 연결
-    if not FileExists(GetDatabaseFilePath) then
-      CreateDatabase
-    else
-      ConnectToDatabase;
-
-    // 메타 테이블 존재 확인 및 생성
-    if FDBConnection.Connected then
-      EnsureMetaTableExists;
-  except
-    on E: Exception do
-      LogError('DatabaseHandler 초기화 오류: ' + E.Message);
-  end;
-end;
-
-function TDatabaseLogHandler.CreateDatabase: Boolean;
-begin
-  Result := False;
-  try
-    with FDBConnection do
-    begin
-      Properties.Clear;
-      Properties.Values['dialect'] := '3';
-      Properties.Values['CreateNewDatabase'] :=
-        'CREATE DATABASE ' + QuotedStr(Database) +
-        ' USER ' + QuotedStr('SYSDBA') +
-        ' PASSWORD ' + QuotedStr('masterkey') +
-        ' PAGE_SIZE 16384 DEFAULT CHARACTER SET UTF8';
-    end;
-
-    FDBConnection.Connect;
-    Result := FDBConnection.Connected;
-  except
-    on E: Exception do
-      LogError('로그 데이터베이스 생성 오류: ' + E.Message);
-  end;
-end;
-
-function TDatabaseLogHandler.ConnectToDatabase: Boolean;
-begin
-  Result := False;
-  try
-    // 이미 연결되어 있다면 재연결할 필요 없음
-    if FDBConnection.Connected then
-    begin
-      Result := True;
-      Exit;
-    end;
-
-    FDBConnection.Connect;
-    Result := FDBConnection.Connected;
-  except
-    on E: Exception do
-      LogError('로그 데이터베이스 연결 오류: ' + E.Message);
-  end;
-end;
-
-function TDatabaseLogHandler.GetDatabaseFilePath: string;
-begin
-  Result := FAppPath + 'log\Log.fdb';
-end;
-
-function TDatabaseLogHandler.GetClientLibPath: string;
-begin
-  Result := FAppPath + 'fbclient.dll';
-end;
-
-procedure TDatabaseLogHandler.EnsureMetaTableExists;
-begin
-  // 메타 테이블 존재 여부 확인
-  if not TableExists(FMetaTableName) then
-  begin
-    // 메타 테이블 생성
-    ExecuteSQL(
-      'CREATE TABLE ' + FMetaTableName + ' (' +
-      'TABLE_NAME VARCHAR(50) NOT NULL PRIMARY KEY, ' +
-      'YEAR_MONTH VARCHAR(6) NOT NULL, ' +
-      'CREATION_DATE TIMESTAMP NOT NULL, ' +
-      'LAST_UPDATE TIMESTAMP, ' +
-      'ROW_COUNT INTEGER DEFAULT 0)'
-    );
-
-    // 인덱스 생성
-    ExecuteSQL(
-      'CREATE INDEX IDX_' + FMetaTableName + '_YEAR_MONTH ON ' +
-      FMetaTableName + ' (YEAR_MONTH)'
-    );
-  end;
-end;
-
-procedure TDatabaseLogHandler.EnsureCurrentLogTableExists;
-var
-  TableName: string;
-  YearMonth: string;
-begin
-  // 마지막 확인으로부터 일정 시간이 지났거나 초기 상태인 경우에만 확인
-  if (MinutesBetween(Now, FLastTableCheck) > FTableCheckInterval) or (FCurrentLogTable = '') then
-  begin
-    TableName := GetCurrentTableName;
-    YearMonth := FormatDateTime('YYYYMM', Now);
-
-    // 현재 월 테이블이 존재하는지 확인
-    if not TableExists(TableName) then
-    begin
-      // 새 로그 테이블 생성
-      ExecuteSQL(
-        'CREATE TABLE ' + TableName + ' (' +
-        'ID INTEGER NOT NULL PRIMARY KEY, ' +
-        'LOG_TIME TIMESTAMP NOT NULL, ' +
-        'LOG_DATE DATE COMPUTED BY (CAST(LOG_TIME AS DATE)), ' + // 날짜 필드 추가
-        'LOG_LEVEL VARCHAR(10) NOT NULL, ' +
-        'SOURCE_NAME VARCHAR(100), ' +
-        'MESSAGE BLOB SUB_TYPE TEXT, ' +
-        'ADDITIONAL_INFO BLOB SUB_TYPE TEXT)'
-      );
-
-      // 시퀀스 생성 (ID 자동 증가용)
-      ExecuteSQL(
-        'CREATE SEQUENCE GEN_' + TableName + '_ID'
-      );
-
-      // 인덱스 생성
-      ExecuteSQL(
-        'CREATE INDEX IDX_' + TableName + '_LOG_TIME ON ' +
-        TableName + ' (LOG_TIME)'
-      );
-
-      ExecuteSQL(
-        'CREATE INDEX IDX_' + TableName + '_LOG_DATE ON ' +
-        TableName + ' (LOG_DATE)'
-      );
-
-      ExecuteSQL(
-        'CREATE INDEX IDX_' + TableName + '_LOG_LEVEL ON ' +
-        TableName + ' (LOG_LEVEL)'
-      );
-
-      // 메타 테이블에 등록
-      RegisterLogTable(TableName, YearMonth);
-    end;
-
-    // 현재 테이블 이름 저장 및 확인 시간 업데이트
-    FCurrentLogTable := TableName;
-    FLastTableCheck := Now;
-
-    // 오래된 테이블 관리
-    ManageLogTables;
-  end;
-end;
-
-function TDatabaseLogHandler.GetCurrentTableName: string;
-begin
-  // 현재 년월에 해당하는 테이블 이름 생성 (예: LOG_202504)
-  Result := 'LOG_' + FormatDateTime('YYYYMM', Now);
-end;
-
-function TDatabaseLogHandler.TableExists(const ATableName: string): Boolean;
-begin
-  Result := False;
-
-  if not FDBConnection.Connected then
-    if not ConnectToDatabase then
-      Exit;
-
-  try
-    FMetaQuery.Close;
-    FMetaQuery.SQL.Text :=
-      'SELECT 1 FROM RDB$RELATIONS ' +
-      'WHERE RDB$RELATION_NAME = ''' + UpperCase(ATableName) + '''';
-    FMetaQuery.Open;
-    Result := not FMetaQuery.EOF;
-    FMetaQuery.Close;
-  except
-    on E: Exception do
-      LogWarning('테이블 존재 확인 오류: ' + E.Message);
-  end;
-end;
-
-function TDatabaseLogHandler.RegisterLogTable(const ATableName, AYearMonth: string): Boolean;
-begin
-  Result := False;
-
-  if not FDBConnection.Connected then
-    if not ConnectToDatabase then
-      Exit;
-
-  try
-    FMetaQuery.Close;
-    FMetaQuery.SQL.Text :=
-      'INSERT INTO ' + FMetaTableName +
-      ' (TABLE_NAME, YEAR_MONTH, CREATION_DATE, LAST_UPDATE, ROW_COUNT) ' +
-      'VALUES (:TNAME, :YMONTH, :CDATE, :LUPDATE, 0)';
-
-    FMetaQuery.ParamByName('TNAME').AsString := ATableName;
-    FMetaQuery.ParamByName('YMONTH').AsString := AYearMonth;
-    FMetaQuery.ParamByName('CDATE').AsDateTime := Now;
-    FMetaQuery.ParamByName('LUPDATE').AsDateTime := Now;
-
-    FMetaQuery.ExecSQL;
-    Result := True;
-  except
-    on E: Exception do
-      LogWarning('로그 테이블 등록 오류: ' + E.Message);
-  end;
-end;
-
-function TDatabaseLogHandler.UpdateLogTableMetrics(const ATableName: string): Boolean;
-var
-  RowCount: Integer;
-begin
-  Result := False;
-
-  if not FDBConnection.Connected then
-    if not ConnectToDatabase then
-      Exit;
-
-  try
-    // 테이블의 현재 행 수 가져오기
-    FMetaQuery.Close;
-    FMetaQuery.SQL.Text := 'SELECT COUNT(*) FROM ' + ATableName;
-    FMetaQuery.Open;
-    RowCount := FMetaQuery.Fields[0].AsInteger;
-    FMetaQuery.Close;
-
-    // 메타 테이블 업데이트
-    FMetaQuery.SQL.Text :=
-      'UPDATE ' + FMetaTableName +
-      ' SET LAST_UPDATE = :LUPDATE, ROW_COUNT = :RCOUNT ' +
-      'WHERE TABLE_NAME = :TNAME';
-
-    FMetaQuery.ParamByName('LUPDATE').AsDateTime := Now;
-    FMetaQuery.ParamByName('RCOUNT').AsInteger := RowCount;
-    FMetaQuery.ParamByName('TNAME').AsString := ATableName;
-
-    FMetaQuery.ExecSQL;
-    Result := True;
-  except
-    on E: Exception do
-      LogWarning('로그 테이블 메트릭 업데이트 오류: ' + E.Message);
-  end;
-end;
-
-procedure TDatabaseLogHandler.DoWriteLog(const AMsg: string; const ALevel: TLogLevel; const ATag: string);
-var
-  LevelStr: string;
-begin
-  // 현재 로그 테이블이 존재하는지 확인하고 필요시 생성
-  EnsureCurrentLogTableExists;
-
-  if FCurrentLogTable = '' then
-    Exit;
-
-  if not FDBConnection.Connected then
-    if not ConnectToDatabase then
-      Exit;
-
-  try
-    // 로그 레벨을 문자열로 변환
-    case ALevel of
-      llDevelop: LevelStr := 'DEVELOP';
-      llDebug:   LevelStr := 'DEBUG';
-      llInfo:    LevelStr := 'INFO';
-      llWarning: LevelStr := 'WARNING';
-      llError:   LevelStr := 'ERROR';
-      llFatal:   LevelStr := 'FATAL';
-      else       LevelStr := 'UNKNOWN';
-    end;
-
-    // 로그 기록
-    FLogQuery.Close;
-    FLogQuery.SQL.Text :=
-      'INSERT INTO ' + FCurrentLogTable +
-      ' (ID, LOG_TIME, LOG_LEVEL, SOURCE_NAME, MESSAGE, ADDITIONAL_INFO) ' +
-      'VALUES (NEXT VALUE FOR GEN_' + FCurrentLogTable + '_ID, ' +
-      ':LTIME, :LLEVEL, :LSOURCE, :LMSG, :LINFO)';
-
-    FLogQuery.ParamByName('LTIME').AsDateTime := Now;
-    FLogQuery.ParamByName('LLEVEL').AsString := LevelStr;
-    FLogQuery.ParamByName('LSOURCE').AsString := BuildSourceIdentifier(ATag);
-    FLogQuery.ParamByName('LMSG').AsString := AMsg;
-    FLogQuery.ParamByName('LINFO').AsString := ''; // 추가 정보는 필요시 여기에 구현
-
-    FLogQuery.ExecSQL;
-  except
-    on E: Exception do
-    begin
-      // 로그 기록 실패 시 자기 자신에게 무한 재귀 호출이 발생하지 않도록 ShowMessage 사용
-      ShowMessage('로그 기록 오류: ' + E.Message);
-    end;
-  end;
-end;
-
-function TDatabaseLogHandler.GetLogs(const AFromDate, AToDate: TDateTime;
-                                    const ALevel: TLogLevel = llInfo;
-                                    const ATag: string = ''): TStringList;
-var
-  FromYearMonth, ToYearMonth: string;
-  YearMonth: string;
-  YM: Integer;
-  SQLWhere, SQLUnion: string;
-  TableList: TStringList;
-  TableYM: string;
-  i: Integer;
-  LogEntry: string;
-  LevelStr: string;
-begin
-  Result := TStringList.Create;
-
-  if not FDBConnection.Connected then
-    if not ConnectToDatabase then
-      Exit;
-
-  try
-    // 로그 레벨을 문자열로 변환
-    case ALevel of
-      llDevelop: LevelStr := 'DEVELOP';
-      llDebug:   LevelStr := 'DEBUG';
-      llInfo:    LevelStr := 'INFO';
-      llWarning: LevelStr := 'WARNING';
-      llError:   LevelStr := 'ERROR';
-      llFatal:   LevelStr := 'FATAL';
-      else       LevelStr := '';
-    end;
-
-    // 조회 범위의 년월 구하기
-    FromYearMonth := FormatDateTime('YYYYMM', AFromDate);
-    ToYearMonth := FormatDateTime('YYYYMM', AToDate);
-
-    // 메타 테이블에서 해당 기간의 테이블 목록 가져오기
-    TableList := TStringList.Create;
-    try
-      FMetaQuery.Close;
-      FMetaQuery.SQL.Text :=
-        'SELECT TABLE_NAME, YEAR_MONTH FROM ' + FMetaTableName +
-        ' WHERE YEAR_MONTH >= :FROM_YM AND YEAR_MONTH <= :TO_YM ' +
-        'ORDER BY YEAR_MONTH';
-
-      FMetaQuery.ParamByName('FROM_YM').AsString := FromYearMonth;
-      FMetaQuery.ParamByName('TO_YM').AsString := ToYearMonth;
-
-      FMetaQuery.Open;
-
-      while not FMetaQuery.EOF do
+      if not FConnection.Connected then
       begin
-        TableList.Add(FMetaQuery.FieldByName('TABLE_NAME').AsString + '=' +
-                     FMetaQuery.FieldByName('YEAR_MONTH').AsString);
-        FMetaQuery.Next;
-      end;
-
-      FMetaQuery.Close;
-
-      // 조건절 생성
-      SQLWhere := 'WHERE LOG_TIME BETWEEN :FROM_DATE AND :TO_DATE ';
-
-      if LevelStr <> '' then
-        SQLWhere := SQLWhere + 'AND LOG_LEVEL = :LOG_LEVEL ';
-
-      if ATag <> '' then
-        SQLWhere := SQLWhere + 'AND SOURCE_NAME LIKE :SOURCE ';
-
-      // UNION 쿼리 생성
-      SQLUnion := '';
-
-      for i := 0 to TableList.Count - 1 do
-      begin
-        if i > 0 then
-          SQLUnion := SQLUnion + ' UNION ALL ';
-
-        SQLUnion := SQLUnion +
-          'SELECT ID, LOG_TIME, LOG_LEVEL, SOURCE_NAME, MESSAGE, ADDITIONAL_INFO FROM ' +
-          Copy(TableList[i], 1, Pos('=', TableList[i]) - 1) + ' ' + SQLWhere;
-      end;
-
-      // 테이블이 없으면 빈 결과 반환
-      if SQLUnion = '' then
-        Exit;
-
-      // 최종 쿼리 생성 및 실행
-      FLogQuery.Close;
-      FLogQuery.SQL.Text :=
-        SQLUnion + ' ORDER BY LOG_TIME DESC';
-
-      FLogQuery.ParamByName('FROM_DATE').AsDateTime := AFromDate;
-      FLogQuery.ParamByName('TO_DATE').AsDateTime := AToDate;
-
-      if LevelStr <> '' then
-        FLogQuery.ParamByName('LOG_LEVEL').AsString := LevelStr;
-
-      if ATag <> '' then
-        FLogQuery.ParamByName('SOURCE').AsString := '%' + ATag + '%';
-
-      FLogQuery.Open;
-
-      // 결과를 문자열 목록으로 변환
-      while not FLogQuery.EOF do
-      begin
-        LogEntry :=
-          FormatDateTime('YYYY-MM-DD HH:NN:SS.ZZZ', FLogQuery.FieldByName('LOG_TIME').AsDateTime) + #9 +
-          FLogQuery.FieldByName('LOG_LEVEL').AsString + #9 +
-          FLogQuery.FieldByName('SOURCE_NAME').AsString + #9 +
-          FLogQuery.FieldByName('MESSAGE').AsString;
-
-        Result.Add(LogEntry);
-        FLogQuery.Next;
-      end;
-
-      FLogQuery.Close;
-    finally
-      TableList.Free;
-    end;
-  except
-    on E: Exception do
-    begin
-      LogWarning('로그 조회 오류: ' + E.Message);
-      FreeAndNil(Result);
-      Result := TStringList.Create;
-    end;
-  end;
-end;
-
-procedure TDatabaseLogHandler.ManageLogTables;
-var
-  RetentionDate: TDateTime;
-  YearMonth: string;
-  TableList: TStringList;
-  TableName, TableYM: string;
-  i: Integer;
-  TableDate: TDateTime;
-  Pos: Integer;
-begin
-  if not FDBConnection.Connected then
-    if not ConnectToDatabase then
-      Exit;
-
-  try
-    // 현재 날짜에서 유지 기간을 뺀 날짜 계산 (기본: 12개월)
-    RetentionDate := IncMonth(Now, -FRetentionMonths);
-    YearMonth := FormatDateTime('YYYYMM', RetentionDate);
-
-    // 모든 로그 테이블 목록 가져오기
-    TableList := GetLogTableList;
-    try
-      for i := 0 to TableList.Count - 1 do
-      begin
-        TableName := TableList[i];
-
-        // 테이블 이름에서 날짜 추출 (예: LOG_202101)
-        if GetTableDate(TableName, TableDate) then
-        begin
-          // 보관 기간 초과 테이블 삭제
-          if TableDate < RetentionDate then
+        try
+          FConnection.Connect;
+        except
+          on E: Exception do
           begin
-            // 테이블 삭제
-            ExecuteSQL('DROP TABLE ' + TableName);
-
-            // 시퀀스 삭제
-            ExecuteSQL('DROP SEQUENCE GEN_' + TableName + '_ID');
-
-            // 메타테이블에서 삭제
-            FMetaQuery.Close;
-            FMetaQuery.SQL.Text :=
-              'DELETE FROM ' + FMetaTableName +
-              ' WHERE TABLE_NAME = :TNAME';
-
-            FMetaQuery.ParamByName('TNAME').AsString := TableName;
-            FMetaQuery.ExecSQL;
+            DebugToFile('DatabaseHandler 데이터베이스 연결 오류: ' + E.Message);
+            Exit; // 연결 실패 시 더 이상 진행하지 않음
           end;
         end;
+
+        // 테이블 자동 생성이 활성화되어 있으면 테이블 생성
+        if FAutoCreateTable then
+          CreateLogTable;
+
+        // 테이블 생성 후에 오래된 로그 정리 실행
+        CleanupOldLogs;
+      end;
+    end;
+  except
+    on E: Exception do
+      DebugToFile('DatabaseHandler 초기화 오류: ' + E.Message);
+  end;
+end;
+
+procedure TDatabaseHandler.Shutdown;
+begin
+  try
+    // 로그 큐 플러시
+    FlushQueue;
+
+    // 데이터베이스 연결 종료
+    if FConnection.Connected then
+      FConnection.Disconnect;
+  except
+    on E: Exception do
+      DebugToFile('DatabaseHandler 종료 오류: ' + E.Message);
+  end;
+
+  inherited;
+end;
+
+procedure TDatabaseHandler.SetConnection(const AHost, ADatabase, AUser, APassword: string);
+var
+  AppPath: string;
+  DbPath: string;
+  LogDbFile: string;
+begin
+  try
+    // 이미 연결되어 있으면 먼저 연결 종료
+    if FConnection.Connected then
+      FConnection.Disconnect;
+
+    // 애플리케이션 경로와 DB 경로 설정
+    AppPath := ExtractFilePath(ParamStr(0));
+    DbPath := IncludeTrailingPathDelimiter(AppPath) + 'logs';
+
+    // 로그 디렉토리가 없으면 생성
+    if not DirectoryExists(DbPath) then
+    begin
+      try
+        ForceDirectories(DbPath);
+        DebugToFile('로그 디렉토리 생성: ' + DbPath);
+      except
+        on E: Exception do
+        begin
+          DebugToFile('로그 디렉토리 생성 실패: ' + E.Message);
+          // 현재 디렉토리로 대체
+          DbPath := AppPath;
+        end;
+      end;
+    end;
+
+    // DB 파일 경로 설정 (사용자 지정 이름이 있으면 사용, 없으면 기본 'Log.fdb' 사용)
+    if ADatabase <> '' then
+      LogDbFile := ADatabase
+    else
+      LogDbFile := 'Log.fdb';
+
+    LogDbFile := IncludeTrailingPathDelimiter(DbPath) + LogDbFile;
+
+    DebugToFile('데이터베이스 경로: ' + LogDbFile);
+
+    // 연결 정보 설정
+    FConnection.Protocol := 'firebird';
+    FConnection.ClientCodepage := 'UTF8';
+    FConnection.LibraryLocation := AppPath + 'fbclient.dll';
+    FConnection.HostName := AHost;
+    FConnection.Database := LogDbFile;
+    FConnection.User := AUser;
+    FConnection.Password := APassword;
+
+    // DB가 없으면 생성
+    if not FileExists(LogDbFile) then
+    begin
+      DebugToFile('데이터베이스 파일이 없음, 생성 시도: ' + LogDbFile);
+      FConnection.Properties.Clear;
+      FConnection.Properties.Values['dialect'] := '3';
+      FConnection.Properties.Values['CreateNewDatabase'] :=
+        'CREATE DATABASE ' + QuotedStr(LogDbFile) +
+        ' USER ' + QuotedStr(AUser) +
+        ' PASSWORD ' + QuotedStr(APassword) +
+        ' PAGE_SIZE 16384 DEFAULT CHARACTER SET UTF8';
+
+      try
+        FConnection.Connect;
+        DebugToFile('데이터베이스 생성 성공');
+      except
+        on E: Exception do
+          DebugToFile('데이터베이스 생성 실패: ' + E.Message);
+      end;
+    end
+    else
+    begin
+      DebugToFile('기존 데이터베이스 파일에 연결 시도');
+      try
+        FConnection.Connect;
+        DebugToFile('데이터베이스 연결 성공');
+      except
+        on E: Exception do
+          DebugToFile('데이터베이스 연결 실패: ' + E.Message);
+      end;
+    end;
+
+    // 테이블 생성 시도
+    if FConnection.Connected and FAutoCreateTable then
+      CreateLogTable;
+
+  except
+    on E: Exception do
+      DebugToFile('DatabaseHandler 연결 설정 오류: ' + E.Message);
+  end;
+end;
+
+procedure TDatabaseHandler.CreateLogTable;
+begin
+  try
+    if not FConnection.Connected then
+    begin
+      try
+        FConnection.Connect;
+      except
+        on E: Exception do
+        begin
+          DebugToFile('DatabaseHandler 테이블 생성 중 연결 오류: ' + E.Message);
+          Exit;
+        end;
+      end;
+    end;
+
+    try
+      // 테이블 존재 여부 확인을 위한 쿼리 (Firebird 구문)
+      FLogQuery.Close;
+      FLogQuery.SQL.Text :=
+        'SELECT COUNT(*) FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = ''' + UpperCase(FTableName) + '''';
+      FLogQuery.Open;
+
+      if FLogQuery.Fields[0].AsInteger = 0 then
+      begin
+        // 테이블이 없으면 생성 - TIME WITHOUT TIME ZONE 사용
+        FLogQuery.Close;
+        FLogQuery.SQL.Text :=
+          'CREATE TABLE ' + FTableName + ' (' +
+          '  ID INTEGER NOT NULL PRIMARY KEY,' +
+          '  LDATE DATE NOT NULL,' +
+          '  LTIME TIME WITHOUT TIME ZONE NOT NULL,' + // 밀리초까지 저장 가능한 시간 타입
+          '  LLEVEL VARCHAR(20) NOT NULL,' + // 문자열로 저장
+          '  LSOURCE VARCHAR(100),' +
+          '  LMESSAGE VARCHAR(4000)' +
+          ')';
+
+        DebugToFile('테이블 생성 시도: ' + FLogQuery.SQL.Text);
+        FLogQuery.ExecSQL;
+        DebugToFile('테이블 생성 성공');
+
+        // 시퀀스 생성
+        FLogQuery.SQL.Text := 'CREATE SEQUENCE SEQ_' + FTableName;
+        FLogQuery.ExecSQL;
+        DebugToFile('시퀀스 생성 성공');
+
+        // 트리거 생성
+        FLogQuery.SQL.Text :=
+          'CREATE TRIGGER ' + FTableName + '_BI FOR ' + FTableName + ' ' +
+          'ACTIVE BEFORE INSERT POSITION 0 AS ' +
+          'BEGIN ' +
+          '  IF (NEW.ID IS NULL) THEN ' +
+          '    NEW.ID = NEXT VALUE FOR SEQ_' + FTableName + '; ' +
+          'END';
+        FLogQuery.ExecSQL;
+        DebugToFile('트리거 생성 성공');
+      end
+      else
+      begin
+        FLogQuery.Close;
+        DebugToFile('테이블이 이미 존재함: ' + FTableName);
+      end;
+    except
+      on E: Exception do
+        DebugToFile('DatabaseHandler 테이블 생성 SQL 오류: ' + E.Message);
+    end;
+  except
+    on E: Exception do
+      DebugToFile('DatabaseHandler 테이블 생성 오류: ' + E.Message);
+  end;
+end;
+
+procedure TDatabaseHandler.CleanupOldLogs;
+var
+  CutoffDate: TDateTime;
+  DaysSinceLastCleanup: Integer;
+  TableExists: Boolean;
+begin
+  try
+    // 하루에 한 번만 정리 실행
+    DaysSinceLastCleanup := DaysBetween(Now, FLastCleanupDate);
+    if DaysSinceLastCleanup < 1 then
+      Exit;
+
+    if not FConnection.Connected then
+      FConnection.Connect;
+
+    // 보관 기간이 0 이하인 경우 정리하지 않음
+    if FRetentionMonths <= 0 then
+      Exit;
+
+    // 테이블이 존재하는지 먼저 확인
+    TableExists := False;
+    try
+      FLogQuery.Close;
+      FLogQuery.SQL.Text :=
+        'SELECT COUNT(*) FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = ''' + UpperCase(FTableName) + '''';
+      FLogQuery.Open;
+      TableExists := (FLogQuery.Fields[0].AsInteger > 0);
+      FLogQuery.Close;
+    except
+      DebugToFile('테이블 존재 여부 확인 실패');
+      Exit;
+    end;
+
+    // 테이블이 존재하지 않으면 정리하지 않음
+    if not TableExists then
+    begin
+      DebugToFile('로그 테이블이 존재하지 않아 정리를 건너뜁니다: ' + FTableName);
+      // 마지막 정리 날짜 업데이트 (다음 오류 방지)
+      FLastCleanupDate := Now;
+      Exit;
+    end;
+
+    // 보관 기간에 따른 기준 날짜 계산 (오늘로부터 X개월 전)
+    CutoffDate := IncMonth(Date, -FRetentionMonths);
+
+    // 기준 날짜보다 오래된 로그 삭제
+    FLogQuery.Close;
+    FLogQuery.SQL.Text :=
+      'DELETE FROM ' + FTableName + ' WHERE LDATE < :CutoffDate';
+    FLogQuery.ParamByName('CutoffDate').AsDate := CutoffDate;
+    FLogQuery.ExecSQL;
+
+    // 마지막 정리 날짜 업데이트
+    FLastCleanupDate := Now;
+
+    DebugToFile(Format('DatabaseHandler 로그 정리 완료: %d개월 이전 로그 삭제 (%s 이전)',
+                      [FRetentionMonths, FormatDateTime('yyyy-mm-dd', CutoffDate)]));
+  except
+    on E: Exception do
+      DebugToFile('DatabaseHandler 로그 정리 오류: ' + E.Message);
+  end;
+end;
+
+function TDatabaseHandler.LogLevelToStr(ALevel: TLogLevel): string;
+begin
+  case ALevel of
+    //llTrace: Result := 'TRACE';
+    llDebug: Result := 'DEBUG';
+    llInfo: Result := 'INFO';
+    llWarning: Result := 'WARNING';
+    llError: Result := 'ERROR';
+    llFatal: Result := 'FATAL';
+    else Result := 'UNKNOWN';
+  end;
+end;
+
+function TDatabaseHandler.BuildSourceIdentifier(const ATag: string): string;
+var
+  ProcessID: Cardinal;
+  ThreadID: Cardinal;
+begin
+  ProcessID := GetProcessID;
+  ThreadID := GetCurrentThreadID;
+
+  // 소스 식별자 형식: TAG-ProcessID-ThreadID
+  if ATag <> '' then
+    Result := Format('%s-%d-%d', [ATag, ProcessID, ThreadID])
+  else
+    Result := Format('APP-%d-%d', [ProcessID, ThreadID]);
+end;
+
+procedure TDatabaseHandler.WriteLog(const Msg: string; Level: TLogLevel);
+var
+  LogItem: PDBLogQueueItem;
+  List: TList;
+  SourceTag, LogMessage: string;
+  LevelStr: string;
+  CurrentTime: TDateTime;
+  Start, End_: Integer;
+begin
+  // 하루에 한 번 오래된 로그 정리
+  if DaysBetween(Now, FLastCleanupDate) >= 1 then
+    CleanupOldLogs;
+
+  // 로그 레벨을 문자열로 변환
+  LevelStr := LogLevelToStr(Level);
+
+  // 현재 시간 가져오기 (밀리초 포함)
+  CurrentTime := Now;
+
+  // 원본 메시지에서 태그 부분과 실제 메시지 부분 분리
+  // 메시지 형식: [yyyy-mm-dd hh:nn:ss.zzz] [LEVEL] [Source] Message
+  if Pos('[', Msg) = 1 then
+  begin
+    // 태그가 포함된 형식 ([시간][레벨][소스] 메시지)
+    SourceTag := LevelStr;
+    LogMessage := Msg;
+
+    // 레벨 정보가 이미 메시지에 포함되어 있으면 그대로 사용
+    if Pos('[' + LevelStr + ']', Msg) > 0 then
+    begin
+      // 메시지에서 소스 태그 추출 시도
+      Start := Pos('[', Msg, Pos(']', Msg, Pos(']', Msg) + 1) + 1);
+      if Start > 0 then
+      begin
+        End_ := Pos(']', Msg, Start);
+        if End_ > 0 then
+          SourceTag := Copy(Msg, Start + 1, End_ - Start - 1);
+      end;
+
+      // 실제 메시지 부분 추출
+      Start := Pos(']', Msg, Pos(']', Msg, Pos(']', Msg) + 1) + 1);
+      if Start > 0 then
+        LogMessage := Trim(Copy(Msg, Start + 1, Length(Msg)));
+    end;
+  end
+  else
+  begin
+    // 태그가 없는 단순 메시지
+    SourceTag := LevelStr;
+    LogMessage := Msg;
+  end;
+
+  if AsyncMode = amThread then
+  begin
+    // 비동기 모드: 큐에 메시지 추가
+    New(LogItem);
+    LogItem^.Message := LogMessage; // 실제 메시지 부분만 저장
+    LogItem^.Level := Level;
+    LogItem^.Tag := SourceTag;  // 추출된 소스 태그 사용
+
+    List := FLogQueue.LockList;
+    try
+      List.Add(LogItem);
+
+      // 큐 크기 확인 및 필요시 플러시
+      if List.Count >= FQueueMaxSize then
+      begin
+        FLogQueue.UnlockList;
+        FlushQueue;
       end;
     finally
-      TableList.Free;
+      if List <> nil then
+        FLogQueue.UnlockList;
     end;
-  except
-    on E: Exception do
-      LogWarning('로그 테이블 관리 오류: ' + E.Message);
+  end
+  else
+  begin
+    // 동기 모드: 직접 데이터베이스에 기록
+    try
+      if not FConnection.Connected then
+        FConnection.Connect;
+
+      FLogQuery.Close;
+      FLogQuery.SQL.Text :=
+        'INSERT INTO ' + FTableName + ' (LDATE, LTIME, LLEVEL, LSOURCE, LMESSAGE) ' +
+        'VALUES (:LDATE, :LTIME, :LLEVEL, :LSOURCE, :LMESSAGE)';
+
+      FLogQuery.ParamByName('LDATE').AsDate := Date;
+      FLogQuery.ParamByName('LTIME').AsTime := CurrentTime; // 시간 타입으로 저장 (밀리초 포함)
+      FLogQuery.ParamByName('LLEVEL').AsString := LevelStr;
+      FLogQuery.ParamByName('LSOURCE').AsString := SourceTag;
+      FLogQuery.ParamByName('LMESSAGE').AsString := LogMessage;
+
+      FLogQuery.ExecSQL;
+    except
+      on E: Exception do
+        DebugToFile('DatabaseHandler 로그 작성 오류: ' + E.Message);
+    end;
   end;
 end;
 
-function TDatabaseLogHandler.GetTableDate(const ATableName: string; out ADate: TDateTime): Boolean;
+procedure TDatabaseHandler.FlushQueue;
 var
-  YearMonth: string;
-  Year, Month: Integer;
+  List: TList;
+  i: Integer;
+  LogItem: PDBLogQueueItem;
+  CurrentTime: TDateTime;
 begin
-  Result := False;
-  ADate := 0;
+  List := FLogQueue.LockList;
+  try
+    if List.Count = 0 then
+      Exit;
 
-  // LOG_YYYYMM 형식의 테이블 이름에서 YYYYMM 추출
-  if Length(ATableName) >= 9 then
-  begin
-    YearMonth := Copy(ATableName, 5, 6);
+    try
+      if not FConnection.Connected then
+        FConnection.Connect;
 
-    if TryStrToInt(Copy(YearMonth, 1, 4), Year) and
-       TryStrToInt(Copy(YearMonth, 5, 2), Month) then
-    begin
-      if (Year >= 2000) and (Year <= 2100) and
-         (Month >= 1) and (Month <= 12) then
+      // 트랜잭션 시작
+      if not FConnection.InTransaction then
+        FConnection.StartTransaction;
+
+      // 현재 시간 (밀리초 포함)
+      CurrentTime := Now;
+
+      // 모든 큐 항목 처리
+      for i := 0 to List.Count - 1 do
       begin
-        ADate := EncodeDate(Year, Month, 1);
-        Result := True;
+        LogItem := PDBLogQueueItem(List[i]);
+
+        FLogQuery.Close;
+        FLogQuery.SQL.Text :=
+          'INSERT INTO ' + FTableName + ' (LDATE, LTIME, LLEVEL, LSOURCE, LMESSAGE) ' +
+          'VALUES (:LDATE, :LTIME, :LLEVEL, :LSOURCE, :LMESSAGE)';
+
+        FLogQuery.ParamByName('LDATE').AsDate := Date;
+        FLogQuery.ParamByName('LTIME').AsTime := CurrentTime; // 시간 타입으로 저장 (밀리초 포함)
+        FLogQuery.ParamByName('LLEVEL').AsString := LogLevelToStr(LogItem^.Level);
+        FLogQuery.ParamByName('LSOURCE').AsString := LogItem^.Tag;
+        FLogQuery.ParamByName('LMESSAGE').AsString := LogItem^.Message;
+
+        FLogQuery.ExecSQL;
+
+        // 메모리 해제
+        Dispose(LogItem);
+      end;
+
+      // 트랜잭션 커밋
+      if FConnection.InTransaction then
+        FConnection.Commit;
+
+      // 처리 완료된 항목 제거
+      List.Clear;
+
+      // 마지막 플러시 시간 갱신
+      FLastQueueFlush := Now;
+    except
+      on E: Exception do
+      begin
+        // 에러 발생 시 트랜잭션 롤백
+        if FConnection.InTransaction then
+          FConnection.Rollback;
+
+        DebugToFile('DatabaseHandler 큐 플러시 오류: ' + E.Message);
       end;
     end;
+  finally
+    FLogQueue.UnlockList;
   end;
 end;
 
-function TDatabaseLogHandler.GetLogTableList: TStringList;
-begin
-  Result := TStringList.Create;
-
-  if not FDBConnection.Connected then
-    if not ConnectToDatabase then
-      Exit;
-
-  try
-    FMetaQuery.Close;
-    FMetaQuery.SQL.Text :=
-      'SELECT TABLE_NAME FROM ' + FMetaTableName +
-      ' ORDER BY YEAR_MONTH';
-
-    FMetaQuery.Open;
-
-    while not FMetaQuery.EOF do
-    begin
-      Result.Add(FMetaQuery.FieldByName('TABLE_NAME').AsString);
-      FMetaQuery.Next;
-    end;
-
-    FMetaQuery.Close;
-  except
-    on E: Exception do
-    begin
-      LogWarning('로그 테이블 목록 조회 오류: ' + E.Message);
-      FreeAndNil(Result);
-      Result := TStringList.Create;
-    end;
-  end;
-end;
-
-function TDatabaseLogHandler.ExecuteSQL(const ASQL: string): Boolean;
-begin
-  Result := False;
-
-  if not FDBConnection.Connected then
-    if not ConnectToDatabase then
-      Exit;
-
-  try
-    FDBConnection.ExecuteDirect(ASQL);
-    Result := True;
-  except
-    on E: Exception do
-      LogWarning('SQL 실행 오류: ' + E.Message + #13#10 + ASQL);
-  end;
-end;
-
-procedure TDatabaseLogHandler.PerformMaintenance;
-begin
-  // 유지보수 작업 수행
-  if FCurrentLogTable <> '' then
-    UpdateLogTableMetrics(FCurrentLogTable);
-
-  // 오래된 테이블 관리
-  ManageLogTables;
-end;
 
 end.
 {
