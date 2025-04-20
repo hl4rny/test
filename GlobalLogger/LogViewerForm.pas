@@ -232,9 +232,6 @@ begin
   finally
     FLoading := False;
   end;
-
-  // 데이터 로드
-  RefreshData;
 end;
 
 // 생성자 구현 추가
@@ -242,6 +239,7 @@ constructor TfrmLogViewer.CreateWithDBHandler(AOwner: TComponent; ADBHandler: TD
 begin
   Create(AOwner);
   FDBHandler := ADBHandler;
+  RefreshData;
 end;
 
 destructor TfrmLogViewer.Destroy;
@@ -760,11 +758,10 @@ begin
     // 자동 스크롤 설정 확인
     ScrollToEnd := chkAutoScroll.Checked;
 
-    // GlobalLogger에서 DatabaseHandler 찾기
-    if not Assigned(FDBHandler) then
+    if not Assigned(FDBHandler) then // 수정
     begin
       // DatabaseHandler가 없으면
-      DebugToFile('FDBHandler가 등록되어 있지 않음.');
+      DebugToFile('TfrmLogViewer.RefreshData: FDBHandler가 할당되지 않았습니다.');
     end
     else
     begin

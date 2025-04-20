@@ -333,7 +333,6 @@ begin
   end;
 end;
 
-
 function GetDatabaseHandler: TDatabaseHandler;
 var
   i: Integer;
